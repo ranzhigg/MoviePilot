@@ -241,3 +241,7 @@ Docker 镜像发布前还会使用 Trivy 扫描 OS 与语言包；根目录 `.tr
 - [pip-audit](https://github.com/pypa/pip-audit)
 - [MoviePilot-Resources](https://github.com/jxxghp/MoviePilot-Resources)
 - [MoviePilot-Plugins](https://github.com/jxxghp/MoviePilot-Plugins)
+
+## 个人 fork 同步
+
+定时合并和失败通知见 [Fork 上游同步](fork-upstream-sync.md)。
