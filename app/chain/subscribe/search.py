@@ -19,6 +19,9 @@ from app.application.subscription.execution import (
     SearchTaskSnapshot,
     SubscriptionExecutionContext,
     SubscriptionSearchRepository,
+    handle_subscription_search_deferred,
+    raise_subscription_site_budget_deferral,
+    raise_subscription_site_budget_failures,
 )
 from app.application.subscription.observability import (
     SearchExecutionSummary,
@@ -31,6 +34,7 @@ from app.application.subscription.observability import (
 from app.application.subscription.query import SubscriptionQueryService
 from app.application.subscription.sitebudget import (
     SubscriptionSearchCancelled,
+    SubscriptionSearchDeferred,
     SubscriptionSiteBudget,
 )
 from app.chain.media import MediaChain
@@ -323,6 +327,12 @@ class _SubscribeSearchQueueCoordinator(_SubscribeOwnerBase):
                     reason = "ttl_timeout" if execution_context.is_expired() else "cancelled"
                     outcome = "failed" if reason == "ttl_timeout" else "cancelled"
                     logger.debug(f"订阅 {subscribe.name} 搜索已在安全边界取消")
+                except SubscriptionSearchDeferred as deferred:
+                    outcome = "skipped"
+                    reason = "site_budget_deferred"
+                    logger.debug(
+                        f"订阅 {subscribe.name} 站点预算冲突，兼容搜索将在 {deferred.retry_at} 后重试"
+                    )
                 except Exception as err:
                     outcome = "failed"
                     reason = "error"
@@ -610,6 +620,10 @@ class _SubscribeSearchQueueOwner(_SubscribeSearchQueueCoordinator):
                     "requeued" if system_stopped else "cancelled",
                     "system_stop" if system_stopped else "cancelled",
                 )
+        except SubscriptionSearchDeferred as deferred:
+            handle_subscription_search_deferred(
+                queue, task_id, lease_token, deferred, summary.record
+            )
         except Exception as err:
             logger.error(f"订阅 {subscribe.name} 搜索失败：{str(err)}", exc_info=True)
             queue.finish_task(
@@ -821,22 +835,27 @@ class SubscribeSearchOwner(_SubscribeSearchQueueOwner):
             filter_params=self.get_params(subscribe),
         )
         site_budget_failures = searchchain.consume_subscription_site_budget_failures()
+        site_budget_deferrals = searchchain.consume_subscription_site_budget_deferrals()
         _ensure_execution_active(execution_context)
         if not contexts:
             logger.debug(f"订阅 {subscribe.keyword or subscribe.name} 未搜索到资源")
+            if not site_budget_failures:
+                raise_subscription_site_budget_deferral(site_budget_deferrals, execution_context)
             self.finish_subscribe_or_not(
                 subscribe=subscribe,
                 meta=meta,
                 mediainfo=mediainfo,
                 lefts=no_exists,
             )
-            self._raise_site_budget_failures(site_budget_failures)
+            raise_subscription_site_budget_failures(site_budget_failures)
             return subscribe
         matched = self._filter_search_contexts(subscribe, contexts)
         if not matched:
             logger.debug(f"订阅 {subscribe.name} 没有符合过滤条件的资源")
+            if not site_budget_failures:
+                raise_subscription_site_budget_deferral(site_budget_deferrals, execution_context)
             self.finish_subscribe_or_not(subscribe=subscribe, meta=meta, mediainfo=mediainfo, lefts=no_exists)
-            self._raise_site_budget_failures(site_budget_failures)
+            raise_subscription_site_budget_failures(site_budget_failures)
             return subscribe
         if execution_context:
             execution_context.report_phase("preparing")
@@ -861,14 +880,9 @@ class SubscribeSearchOwner(_SubscribeSearchQueueOwner):
                 downloads=downloads,
                 lefts=lefts,
             )
-        self._raise_site_budget_failures(site_budget_failures)
+        raise_subscription_site_budget_failures(site_budget_failures)
+        raise_subscription_site_budget_deferral(site_budget_deferrals, execution_context)
         return cast(Optional[SubscriptionSnapshot], current)
-
-    @staticmethod
-    def _raise_site_budget_failures(failures: tuple[str, ...]) -> None:
-        """在成功站点结果完成处理后暴露其余站点的聚合失败。"""
-        if failures:
-            raise RuntimeError("；".join(failures))
 
     def _filter_search_contexts(
         self,

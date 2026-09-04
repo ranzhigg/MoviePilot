@@ -1,6 +1,7 @@
 from typing import List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic import field_validator as _field_validator
 
 from app.schemas.common import JsonData
 from app.schemas.media import OptionalMediaIdentityMixin
@@ -147,6 +148,17 @@ class TransferHistory(OptionalMediaIdentityMixin, BaseModel):
     files: Optional[JsonData] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+    # Pydantic 的动态装饰器类型会被存量 mypy 配置解析为 Any，公开 schema 仍需保留该校验。
+    @_field_validator("errmsg", mode="before")  # type: ignore[misc]
+    @classmethod
+    def _sanitize_error_message(cls, value: object) -> Optional[str]:
+        """历史接口只返回可理解的整理失败原因，数据库原文仍用于诊断。"""
+        if value is None or not str(value).strip():
+            return None
+        from app.runtime.errors import public_error_message
+
+        return public_error_message(value, context="transfer")
 
 
 class BatchTransferHistoryRedoRequest(BaseModel):

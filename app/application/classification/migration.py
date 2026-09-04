@@ -183,7 +183,7 @@ def migrate_legacy_category_config(
     config: Union[CategoryConfig, Mapping[str, object]],
 ) -> LegacyClassificationMigrationResult:
     """
-    把内存中的旧分类配置转换为来源受限的新版策略草稿
+    把内存中的旧分类配置转换为按媒体类型匹配的新版策略草稿
 
     :param config: 已校验的 CategoryConfig 或保持 YAML 顺序的映射
     :return: 包含策略、动态字段声明和结构化诊断的纯迁移结果
@@ -193,7 +193,7 @@ def migrate_legacy_category_config(
     _diagnose_unknown_top_level_keys(root, context)
     categories: list[ClassificationCategory] = []
     rules: list[ClassificationRule] = []
-    source_fallbacks: dict[str, dict[ClassificationMediaType, str]] = {}
+    fallbacks = dict(_COMMON_FALLBACKS)
 
     for media_key, media_type in _MEDIA_TYPES.items():
         _migrate_media_categories(
@@ -202,7 +202,7 @@ def migrate_legacy_category_config(
             raw_categories=root.get(media_key),
             categories=categories,
             rules=rules,
-            source_fallbacks=source_fallbacks,
+            fallbacks=fallbacks,
             context=context,
         )
 
@@ -213,8 +213,7 @@ def migrate_legacy_category_config(
         "mode": "first_match",
         "categories": categories,
         "rules": rules,
-        "fallbacks": dict(_COMMON_FALLBACKS),
-        "source_fallbacks": source_fallbacks,
+        "fallbacks": fallbacks,
         "field_aliases": {field_id: aliases for field_id, aliases in context.field_aliases.items() if aliases},
     }
     policy = ClassificationPolicy.model_validate(policy_payload)
@@ -277,10 +276,10 @@ def _migrate_media_categories(
     raw_categories: object,
     categories: list[ClassificationCategory],
     rules: list[ClassificationRule],
-    source_fallbacks: dict[str, dict[ClassificationMediaType, str]],
+    fallbacks: dict[ClassificationMediaType, str],
     context: _MigrationContext,
 ) -> None:
-    """按单个旧媒体类型的原始顺序迁移分类、规则和来源兜底。"""
+    """按单个旧媒体类型的原始顺序迁移分类、规则和全局兜底。"""
     if raw_categories is None:
         return
     if not isinstance(raw_categories, Mapping):
@@ -304,7 +303,7 @@ def _migrate_media_categories(
                 id=category_id,
                 media_type=media_type,
                 name=name,
-                path=[name],
+                path=_legacy_category_path(name),
                 enabled=not unreachable,
             )
         )
@@ -320,7 +319,7 @@ def _migrate_media_categories(
         rule_mapping = _legacy_rule_mapping(raw_rule)
         if _is_legacy_fallback(raw_rule, rule_mapping):
             if not fallback_seen:
-                source_fallbacks.setdefault(_TMDB_SOURCE, {})[media_type] = category_id
+                fallbacks[media_type] = category_id
                 fallback_seen = True
             if rule_mapping is not None:
                 rules.append(
@@ -430,14 +429,12 @@ def _diagnose_category_name(
     path: Sequence[LegacyDiagnosticPathPart],
     context: _MigrationContext,
 ) -> None:
-    """在仍保留分类的同时标记无法安全作为目录段的名称。"""
+    """在仍保留分类的同时标记无法安全投影为目录路径的名称。"""
     invalid = (
         not isinstance(raw_name, str)
         or not name
         or name != name.strip()
-        or name in {".", ".."}
-        or name.endswith((".", " "))
-        or any(character in _ILLEGAL_PATH_CHARACTERS or ord(character) < 32 for character in name)
+        or any(_legacy_path_segment_is_invalid(segment) for segment in _legacy_category_path(name))
     )
     if invalid:
         context.add_diagnostic(
@@ -446,6 +443,23 @@ def _diagnose_category_name(
             f"分类名称 {name!r} 不能安全投影为目录路径",
             path,
         )
+
+
+def _legacy_category_path(name: str) -> list[str]:
+    """把旧分类名中的斜杠还原为目录层级，同时保留原始显示名称。"""
+    return name.split("/")
+
+
+def _legacy_path_segment_is_invalid(segment: str) -> bool:
+    """判断旧分类名拆出的目录段是否违反跨平台路径安全约束。"""
+    illegal_characters = _ILLEGAL_PATH_CHARACTERS - frozenset({"/"})
+    return (
+        not segment
+        or segment in {".", ".."}
+        or segment != segment.strip()
+        or segment.endswith((".", " "))
+        or any(character in illegal_characters or ord(character) < 32 for character in segment)
+    )
 
 
 def _migrate_legacy_field(
@@ -722,7 +736,7 @@ def _fallback_metadata_rule(
     archived: bool,
     context: _MigrationContext,
 ) -> ClassificationRule:
-    """用禁用规则保留全空字段映射，运行时仍只通过来源兜底命中。"""
+    """用禁用规则保留全空字段映射，运行时由全局兜底处理。"""
     nodes: list[ClassificationConditionNode] = []
     for raw_field in rule_mapping:
         field_path = [*path, str(raw_field)]

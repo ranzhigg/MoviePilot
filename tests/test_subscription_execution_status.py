@@ -84,6 +84,19 @@ def test_execution_status_exposes_site_wait_and_cancel_capability():
     assert statuses[1].can_cancel is True
 
 
+def test_execution_status_exposes_queued_site_wait_without_error():
+    """重新入队的站点预算冲突应显示等待状态而不是失败。"""
+    repository = _Repository()
+    repository.tasks[2] = _task(2, state="queued", phase="waiting_site_budget")
+
+    statuses = asyncio.run(SubscriptionExecutionStatusService(repository).for_subscriptions((2,)))
+
+    assert statuses[2].state == "waiting_site_budget"
+    assert statuses[2].phase == "waiting_site_budget"
+    assert statuses[2].error is None
+    assert statuses[2].can_cancel is True
+
+
 def test_failed_search_exposes_safe_error():
     """搜索失败文本必须压平且不暴露内部错误细节。"""
     repository = _Repository()
@@ -92,7 +105,7 @@ def test_failed_search_exposes_safe_error():
     statuses = asyncio.run(SubscriptionExecutionStatusService(repository).for_subscriptions((3,)))
 
     assert statuses[3].state == "failed"
-    assert statuses[3].error == "provider timeout"
+    assert statuses[3].error == "订阅操作失败，请刷新后重试"
 
 
 def test_batch_requires_complete_subscription_access():

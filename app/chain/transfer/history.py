@@ -35,6 +35,7 @@ class TransferHistoryOwner(_TransferOwnerBase):
         """
         远程重新整理，参数为历史记录 ID，或媒体来源、原生 ID 与类型。
         """
+        from app.runtime.errors import public_error_message
 
         def args_error():
             self.post_message(
@@ -69,7 +70,7 @@ class TransferHistoryOwner(_TransferOwnerBase):
                         channel=channel,
                         title="手动整理失败",
                         source=source,
-                        text=errmsg,
+                        text=public_error_message(errmsg, context="transfer"),
                         userid=userid,
                         link=self.runtime_config.history_url,
                         save_history=False,
@@ -106,7 +107,7 @@ class TransferHistoryOwner(_TransferOwnerBase):
                     channel=channel,
                     title="手动整理失败",
                     source=source,
-                    text=errmsg,
+                    text=public_error_message(errmsg, context="transfer"),
                     userid=userid,
                     link=self.runtime_config.history_url,
                     save_history=False,
@@ -182,8 +183,7 @@ class TransferHistoryOwner(_TransferOwnerBase):
             if not mediainfo:
                 return (
                     False,
-                    f"媒体信息识别失败，media_source：{media_source}，media_id：{media_id}，"
-                    f"type: {mtype.value if mtype else None}",
+                    "未识别到媒体信息，请检查媒体来源和媒体 ID 后重试",
                 )
             if media_source and not isinstance(mediainfo, MusicInfo):
                 mediainfo.scrape_source = media_source

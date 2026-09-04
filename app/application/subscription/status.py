@@ -153,6 +153,8 @@ class SubscriptionExecutionStatusService:
             state = phase = "cancelling"
         elif task.state == "running":
             state = phase = task.phase or "running"
+        elif task.state == "queued" and task.phase == "waiting_site_budget":
+            state = phase = "waiting_site_budget"
         else:
             state = phase = task.state
         return SubscriptionExecutionStatus(
@@ -218,4 +220,6 @@ class SubscriptionExecutionStatusService:
         """压平并限制内部错误文本，避免把堆栈或超长响应暴露给界面。"""
         if not error:
             return None
-        return " ".join(str(error).split())[:500]
+        from app.runtime.errors import public_error_message
+
+        return public_error_message(error, context="subscription")[:500]

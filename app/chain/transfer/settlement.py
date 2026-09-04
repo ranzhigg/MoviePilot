@@ -523,14 +523,14 @@ class TransferSettlementOwner(_TransferOwnerBase):
             manual_identity: bool = False,
     ) -> None:
         """按配置逐条发送或按媒体聚合整理失败通知，供第三方整理补丁复用。"""
+        from app.runtime.errors import public_error_message
         notification = TransferFailureNotification(
             media_title=(
                 task.mediainfo.title_year
-                if task.mediainfo
-                else task.fileitem.name if task.fileitem else "未知媒体"
+                if task.mediainfo else task.fileitem.name if task.fileitem else "未知媒体"
             ),
             season_episode=getattr(task.meta, "season_episode", "") or "",
-            reason=transferinfo.message or "未知",
+            reason=public_error_message(transferinfo.message, context="transfer") or "整理失败",
             history_id=history_id,
             image=(
                 task.mediainfo.get_message_image()
