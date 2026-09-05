@@ -74,6 +74,7 @@ class ChainBase(RecognitionMixin, MessageProcessingMixin, NotificationMixin, met
         self.classification_service = context.classification_service
         self.runtime_config = context.configuration
         self.stop_state = context.stop_state
+        self.system_service = context.system_service
         self.durable_event_writer = context.durable_event_writer
         self._module_dispatcher = context.module_dispatcher_factory(
             module_catalog=self.modulemanager,
@@ -751,7 +752,7 @@ class ChainBase(RecognitionMixin, MessageProcessingMixin, NotificationMixin, met
         self,
         rule_groups: List[str],
         torrent_list: List[TorrentInfo],
-        mediainfo: MediaInfo = None,
+        mediainfo: Optional[Union[MediaInfo, MusicInfo]] = None,
     ) -> List[TorrentInfo]:
         """
         过滤种子资源

@@ -499,6 +499,8 @@ class Context(BaseModel):
     candidate_recognized: Optional[bool] = False
     # 当前 media_info 是否为目标媒体回填
     media_info_is_target: Optional[bool] = False
+    match_status: Optional[str] = None
+    match_reason: Optional[str] = None
     # 下载层确认候选资源覆盖完整目标范围，供订阅事实写入判断整包资源
     confirmed_full_coverage: Optional[bool] = False
 
@@ -539,8 +541,8 @@ class MediaPerson(BaseModel):
     relation: Optional[str] = None
 
 
-def _media_search_result_kind(value: Any) -> str:
-    """按稳定字段区分音乐、人物与影视/合集搜索结果。"""
+def _media_result_kind(value: Any) -> str:
+    """按稳定字段区分音乐、人物与影视/合集结果。"""
     if isinstance(value, BaseModel):
         value = value.model_dump()
     if isinstance(value, dict):
@@ -551,13 +553,22 @@ def _media_search_result_kind(value: Any) -> str:
     return "media"
 
 
+MediaDetailResult = Annotated[
+    Union[
+        Annotated[MusicInfo, Tag("music")],
+        Annotated[MediaInfo, Tag("media")],
+    ],
+    Discriminator(_media_result_kind),
+]
+
+
 MediaSearchResult = Annotated[
     Union[
         Annotated[MusicInfo, Tag("music")],
         Annotated[MediaPerson, Tag("person")],
         Annotated[MediaInfo, Tag("media")],
     ],
-    Discriminator(_media_search_result_kind),
+    Discriminator(_media_result_kind),
 ]
 
 

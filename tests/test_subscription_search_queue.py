@@ -1,8 +1,11 @@
 """订阅搜索持久队列、single-flight、租约和取消测试。"""
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from sqlalchemy import create_engine, select, update
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.adapters.subscriptionsearch import TransactionalSubscriptionSearchRepository
@@ -15,6 +18,43 @@ def _repository(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'search-queue.db'}")
     Base.metadata.create_all(engine)
     return TransactionalSubscriptionSearchRepository(sessionmaker(bind=engine)), engine
+
+
+@pytest.mark.asyncio
+async def test_search_queue_async_enqueue_uses_async_session(tmp_path):
+    """异步新增订阅应通过 AsyncSession 入队，并可由同步消费者继续认领。"""
+    database_path = tmp_path / "async-search-queue.db"
+    async_engine = create_async_engine(f"sqlite+aiosqlite:///{database_path}")
+    async_factory = async_sessionmaker(bind=async_engine, expire_on_commit=False)
+
+    @asynccontextmanager
+    async def async_session_scope():
+        """为测试队列提供独立异步会话。"""
+        async with async_factory() as session:
+            yield session
+
+    async with async_engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sync_engine = create_engine(f"sqlite:///{database_path}")
+    repository = TransactionalSubscriptionSearchRepository(
+        sessionmaker(bind=sync_engine),
+        async_session_scope,
+    )
+
+    try:
+        enqueued = await repository.async_enqueue(
+            subscription_ids=(101,),
+            source="new",
+            priority=50,
+        )
+        claimed = repository.claim_next(owner="worker-async")
+
+        assert enqueued.created_count == 1
+        assert claimed is not None
+        assert claimed.subscription_id == 101
+    finally:
+        sync_engine.dispose()
+        await async_engine.dispose()
 
 
 def test_search_queue_coalesces_active_subscription_and_raises_priority(tmp_path):
@@ -40,7 +80,9 @@ def test_search_queue_coalesces_active_subscription_and_raises_priority(tmp_path
     assert manual.created_count == 0
     assert manual.coalesced_count == 1
     assert manual.batch.state == "completed"
+    assert manual.active_batch_ids == (scheduled.batch.batch_id,)
     assert first.subscription_id == 1
+    assert first.source == "manual"
     assert first.priority == 100
     assert second.subscription_id == 2
     assert first.task_id != second.task_id
@@ -80,6 +122,39 @@ def test_search_queue_claims_each_subscription_only_after_its_available_at(tmp_p
     assert accelerated.subscription_id == 21
     assert accelerated.available_at == ready_at
     assert accelerated.priority == 100
+
+
+def test_manual_search_promotes_scheduled_new_subscription(tmp_path):
+    """用户主动搜索应立即唤醒仍在编辑等待期的新订阅任务。"""
+    repository, engine = _repository(tmp_path)
+    later_at = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat(timespec="seconds")
+    automatic = repository.enqueue(
+        subscription_ids=(22,),
+        source="new",
+        priority=50,
+        available_at_by_subscription={22: later_at},
+    )
+
+    with Session(engine) as session:
+        scheduled = session.execute(
+            select(SubscriptionSearchTask).where(SubscriptionSearchTask.subscription_id == 22)
+        ).scalar_one()
+        assert scheduled.phase == "scheduled"
+
+    manual = repository.enqueue(
+        subscription_ids=(22,),
+        source="manual",
+        priority=120,
+        available_at_by_subscription={22: "1970-01-01T00:00:00+00:00"},
+    )
+    claimed = repository.claim_next(owner="worker-manual")
+
+    assert manual.created_count == 0
+    assert manual.active_batch_ids == (automatic.batch.batch_id,)
+    assert claimed is not None
+    assert claimed.source == "manual"
+    assert claimed.priority == 120
+    assert claimed.phase == "matching"
 
 
 def test_search_queue_recovers_expired_lease_with_same_task_identity(tmp_path):
@@ -269,8 +344,8 @@ def test_search_queue_aggregates_skipped_tasks_without_marking_success(tmp_path)
     assert batch.last_error == "同一订阅正在由其他通道处理，本轮搜索已跳过"
 
 
-def test_search_queue_ages_old_fallback_ahead_of_new_manual_work(tmp_path):
-    """手工任务可优先，但等待超过公平窗口的兜底任务不得持续饥饿。"""
+def test_search_queue_keeps_manual_work_ahead_of_aged_fallback(tmp_path):
+    """用户主动搜索始终先于定时检查，避免点击后长时间没有反馈。"""
     repository, engine = _repository(tmp_path)
     repository.enqueue(subscription_ids=(8,), source="fallback", priority=10)
     aged_at = (datetime.now(timezone.utc) - timedelta(minutes=16)).isoformat(timespec="seconds")
@@ -285,5 +360,5 @@ def test_search_queue_ages_old_fallback_ahead_of_new_manual_work(tmp_path):
 
     claimed = repository.claim_next(owner="worker-a")
 
-    assert claimed.subscription_id == 8
-    assert claimed.source == "fallback"
+    assert claimed.subscription_id == 9
+    assert claimed.source == "manual"

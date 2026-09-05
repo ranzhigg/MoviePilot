@@ -1,15 +1,14 @@
-import re
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 from typing import Any, Callable, Optional
 
 from app.domain.meta.metabase import MetaBase
-from app.schemas.types import MediaSource, MediaType
-from app.schemas.media import resolve_media_identity
 from app.domain.meta.runtime import get_metainfo_accelerator
-
+from app.schemas.media import resolve_media_identity
+from app.schemas.types import MediaSource, MediaType
 
 _AUDIO_FORMAT_PATTERN = re.compile(
     r"(?<![A-Z])(?P<format>DSD(?:64|128|256|512)?|DSF|DFF|SACD|FLAC|ALAC|APE|WAV|WAVE|AIFF?|PCM|"
@@ -355,6 +354,12 @@ _MUSIC_DISC_DIR_RE = re.compile(
 _MUSIC_DIR_YEAR_RE = re.compile(r"[(\[]\s*(?P<year>(?:19|20)\d{2})\s*[)\]]")
 # 目录名中的括号补充说明（格式、音质、厂牌等），如 [FLAC 24bit-96kHz]
 _MUSIC_BRACKET_RE = re.compile(r"\[[^\]]*\]|【[^】]*】|\([^)]*\)")
+_MUSIC_RECORDING_VERSION_RE = re.compile(
+    r"[\[(（【]([^\])）】]*(?:\blive\b|\bremix\b|\binstrumental\b|\bacoustic\b|"
+    r"\bunplugged\b|\bdemo\b|\bkaraoke\b|现场|現場|混音|伴奏|不插电|不插電)[^\])）】]*)[\])）】]",
+    re.IGNORECASE,
+)
+_MUSIC_VERSION_LABEL_RE = re.compile(r"^(?:录音版本|錄音版本|版本|version)\s*[:：]\s*(.+)$", re.IGNORECASE)
 _MUSIC_SPACES_RE = re.compile(r"\s+")
 _MUSIC_COMPACT_RE = re.compile(r"[\W_]+", re.UNICODE)
 # 音乐视频/演唱会资源使用影视场景式命名，但标题语义仍属于音乐。
@@ -707,6 +712,64 @@ class MetaMusic(MetaBase):
     def parse_query(cls, query: str) -> "MetaMusic":
         """把用户输入或资源标题解析为音乐元数据。"""
         return cls(org_string=query, title=query, parse_title=True)
+
+    @classmethod
+    def parse_resource(cls, title: str, subtitle: Optional[str] = None) -> "MetaMusic":
+        """合并资源标题与副标题的独立证据，不使用搜索目标补写作品身份。
+
+        标题解析仍复用 Python/Rust 公共入口；副标题只补缺失字段，保留标题中
+        已有的署名。专辑、曲序、曲名的明确多段格式在资源层统一补充。
+        """
+        meta = cls.parse_query(title)
+        if not meta.title:
+            # 整个作品名位于中文展示括号内时，旧解析器可能把它误当发布标签删除。
+            bracket = re.match(r"^\s*[【《「]([^】》」]+)[】》」]", title)
+            if bracket:
+                meta.apply_title(bracket.group(1))
+                meta.apply_audio_quality(title)
+        if meta.artists and meta.title:
+            track = re.fullmatch(r"(.+?)\s+-\s+(\d{1,3})\s+-\s+(.+)", meta.title)
+            if track:
+                meta.album, number, meta.title = track.groups()
+                meta.track_number = int(number)
+        if subtitle:
+            secondary = cls.parse_query(subtitle)
+            artist = re.search(
+                r"(?:^|[;；\n])\s*(?:艺术家|藝術家|藝人|歌手|演唱|专辑艺人|專輯藝人|artist|performer)"
+                r"\s*[:：]\s*([^;；\n]+)", subtitle, re.I,
+            )
+            if not meta.artists:
+                meta.artists = cls._split_artists(artist.group(1)) if artist else list(secondary.artists)
+            album = re.search(
+                r"(?:^|[;；\n])\s*(?:专辑(?:名|名称)?|專輯(?:名|名稱)?|album)\s*[:：]\s*([^;；\n]+)",
+                subtitle, re.I,
+            )
+            if album and not meta.album:
+                meta.album = album.group(1).strip()
+            elif not meta.album and secondary.artists and secondary.title != meta.title:
+                if {cls.compact_text(item) for item in meta.artists} & {cls.compact_text(item) for item in secondary.artists}:
+                    meta.album = secondary.title
+            if not meta.year:
+                meta.year = secondary.year
+            meta.apply_audio_quality(subtitle)
+        if not meta.version:
+            meta.version = cls._resource_version(title, subtitle)
+        return meta
+
+    @staticmethod
+    def _resource_version(title: str, subtitle: Optional[str]) -> Optional[str]:
+        """优先保留标题版本，副标题仅接受明确版本字段或独立版本标签，避免误读艺名。"""
+        version = _MUSIC_RECORDING_VERSION_RE.search(title)
+        if version:
+            return version.group(1).strip()
+        for field in re.split(r"[;；\n]", subtitle or ""):
+            labelled = _MUSIC_VERSION_LABEL_RE.fullmatch(field.strip())
+            if labelled:
+                return labelled.group(1).strip().strip("[]()（）【】").strip() or None
+            version = _MUSIC_RECORDING_VERSION_RE.fullmatch(field.strip())
+            if version:
+                return version.group(1).strip()
+        return None
 
     @classmethod
     def from_music_info(cls, info: Any) -> "MetaMusic":
@@ -1526,14 +1589,20 @@ class MetaMusic(MetaBase):
 
     @property
     def apply_words(self) -> list[str]:
-        """音乐当前不应用影视自定义识别词。"""
-        return []
+        """返回公共元数据工厂实际应用的识别词，兼容缺少该字段的旧缓存。"""
+        return getattr(self, "_apply_words", [])
+
+    @apply_words.setter
+    def apply_words(self, value: Optional[list[str]]) -> None:
+        """独立保存识别词记录，避免调用方或其它音乐元数据共用可变列表。"""
+        self._apply_words = list(value or [])
 
     def to_dict(self) -> dict[str, Any]:
         """转换为可持久化和传输的字典，字段集与 schemas.MusicMeta 对齐。"""
         return {
             "type": self.type.value,
             "org_string": self.org_string,
+            "apply_words": list(self.apply_words),
             "title": self.title,
             "artists": list(self.artists),
             "artist": self.artist,
@@ -1565,7 +1634,7 @@ class MetaMusic(MetaBase):
         raw_type = data.get("type")
         if raw_type not in (None, MediaType.MUSIC, MediaType.MUSIC.value, "music"):
             raise ValueError(f"不支持的音乐媒体类型：{raw_type}")
-        return cls(
+        meta = cls(
             org_string=data.get("org_string"),
             title=data.get("title"),
             artists=_string_list(data.get("artists") or data.get("artist")),
@@ -1587,6 +1656,8 @@ class MetaMusic(MetaBase):
             media_source=data.get("media_source"),
             media_id=data.get("media_id"),
         )
+        meta.apply_words = data.get("apply_words")
+        return meta
 
 
 def _build_name_result(

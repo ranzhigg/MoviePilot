@@ -13,6 +13,7 @@ class MusicMeta(OptionalMediaIdentityMixin, BaseModel):
 
     type: Literal["音乐"] = "音乐"
     org_string: Optional[str] = None
+    apply_words: list[str] = Field(default_factory=list, description="资源解析时实际应用的自定义识别词")
     title: Optional[str] = None
     artists: list[str] = Field(default_factory=list)
     artist: Optional[str] = None
@@ -83,6 +84,9 @@ class MusicInfo(OptionalMediaIdentityMixin, BaseModel):
     artist_country: Optional[str] = None
     release_status: Optional[str] = None
     names: list[str] = Field(default_factory=list)
+    title_aliases: list[str] = Field(default_factory=list)
+    album_aliases: list[str] = Field(default_factory=list)
+    artist_aliases: list[str] = Field(default_factory=list)
     detail_link: Optional[str] = None
     listen_count: Optional[int] = None
     raw_data: dict[str, JsonData] = Field(default_factory=dict)
@@ -154,6 +158,8 @@ class MusicAlbumInfo(OptionalMediaIdentityMixin, BaseModel):
     artists: list[str] = Field(default_factory=list)
     artist: Optional[str] = None
     artist_ids: list[str] = Field(default_factory=list)
+    title_aliases: list[str] = Field(default_factory=list)
+    artist_aliases: list[str] = Field(default_factory=list)
     album: Optional[str] = None
     album_type: Optional[str] = None
     secondary_types: list[str] = Field(default_factory=list)

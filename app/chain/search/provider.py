@@ -156,14 +156,14 @@ class _SearchProviderSyncOwner(_SearchOwnerBase):
 
     @staticmethod
     def _torrent_keyword(
-        keyword: str,
+        keyword: Optional[str],
         mediainfo: Optional[MediaInfo],
         area: Optional[str],
     ) -> str:
-        """投影站点实际请求关键字，IMDb 搜索只在计划边界转换一次。"""
+        """投影站点实际请求关键字，缺少 IMDb ID 时回退媒体标题。"""
         if area == "imdbid" and mediainfo:
-            return mediainfo.imdb_id or keyword
-        return keyword
+            return mediainfo.imdb_id or keyword or mediainfo.title or ""
+        return keyword or ""
 
     @staticmethod
     def _torrent_type(
@@ -243,11 +243,14 @@ class _SearchProviderSyncOwner(_SearchOwnerBase):
                 raise
             else:
                 budget.record_request(site_id, len(result or []))
-                if observation.attempted and observation.outcome not in {"success", "skipped"}:
-                    failure = observation.error or observation.outcome
-                    self.record_subscription_site_budget_failure(
-                        f"站点 {site.get('name') or site_id} 搜索失败：{failure}"
-                    )
+                if observation.attempted:
+                    if observation.outcome == "success":
+                        budget.record_success(site_id)
+                    elif observation.outcome != "skipped":
+                        failure = observation.error or observation.outcome
+                        message = f"站点 {site.get('name') or site_id} 搜索失败：{failure}"
+                        self.record_subscription_site_budget_failure(message)
+                        logger.warning(message)
                 return result
             finally:
                 try:
@@ -378,8 +381,9 @@ class _SearchProviderSyncOwner(_SearchOwnerBase):
         """通过共享线程 owner 按站点顺序翻页并汇总同步 provider 结果。"""
         indexer_sites = self._sync_indexers(sites)
         media_type = self._torrent_type(mediainfo, mtype)
+        search_keyword = self._torrent_keyword(keyword, mediainfo, area)
         plugin_results = self.search_plugin_torrents(
-            keyword=keyword,
+            keyword=search_keyword,
             mtype=media_type,
             page=page,
         )
@@ -391,7 +395,6 @@ class _SearchProviderSyncOwner(_SearchOwnerBase):
         start_time = datetime.now()
         search_pages = self._build_search_pages(page)
         results = list(plugin_results)
-        search_keyword = self._torrent_keyword(keyword, mediainfo, area)
 
         progress.start()
         try:
@@ -672,13 +675,13 @@ class SearchProviderOwner(_SearchProviderSyncOwner):
         """构造种子 provider 的 canonical 事件流。"""
         indexer_sites = await self._async_indexers(sites)
         media_type = self._torrent_type(mediainfo, mtype)
+        search_keyword = self._torrent_keyword(keyword, mediainfo, area)
         plugin_results = await self.async_search_plugin_torrents(
-            keyword=keyword,
+            keyword=search_keyword,
             mtype=media_type,
             page=page,
         )
         search_pages = self._build_search_pages(page)
-        search_keyword = self._torrent_keyword(keyword, mediainfo, area)
 
         async def search_site_page(
             site: SiteIndexer,
