@@ -677,9 +677,6 @@ class ConfigModel(BaseModel):
     # 对阿里云盘进行快照对比时，是否检查文件夹的修改时间（默认关闭，因为阿里云盘目录时间不随子文件变更而更新）
     ALIPAN_SNAPSHOT_CHECK_FOLDER_MODTIME: bool = False
 
-    # ==================== Docker配置 ====================
-    # Docker Client API地址
-    DOCKER_CLIENT_API: Optional[str] = "tcp://127.0.0.1:38379"
     # Playwright浏览器类型，供智能体浏览器工具和插件直接使用 Playwright 时读取
     PLAYWRIGHT_BROWSER_TYPE: str = "chromium"
 
@@ -919,13 +916,12 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
         if not isinstance(data, dict):
             return data
 
-        # Release 已迁移到后台状态机，历史 release/true 不能继续启用启动时更新。
+        # 仅 true 表示启用后台 Release 检查，其他模式不注册该定时服务。
         if "MOVIEPILOT_AUTO_UPDATE" in data:
             original_update_mode = data["MOVIEPILOT_AUTO_UPDATE"]
+            mode = str(original_update_mode or "").strip().lower()
             normalized_update_mode = (
-                "dev"
-                if str(original_update_mode or "").strip().lower() == "dev"
-                else "false"
+                mode if mode in {"true", "dev", "false"} else "false"
             )
             if normalized_update_mode != str(original_update_mode):
                 cls.update_env_config(

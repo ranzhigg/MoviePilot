@@ -155,15 +155,16 @@ def test_music_cache_key_prefers_media_id():
 
     cache.update(meta, _music_info())
 
-    assert next(iter(cache._cache.data)).startswith("[音乐:v2]")
+    assert next(iter(cache._cache.data)).startswith(f"[音乐:v{music_cache_module.PERSISTENCE_VERSION}]")
     renamed = MetaMusic(title="不同展示名", artists=["不同署名"], media_source="musicbrainz", media_id="rec-1")
     assert cache.get(renamed).media_id == "rec-1"
 
 
-def test_music_cache_rebuilds_legacy_identity_keys(monkeypatch):
-    """旧缓存未区分版本和实体范围，升级后不恢复其中可能串用的身份。"""
+@pytest.mark.parametrize("version", [1, 2])
+def test_music_cache_rebuilds_legacy_identity_keys(monkeypatch, version):
+    """旧缓存可能串用实体或保存了截断名称的错误身份，升级后不再恢复。"""
     file_cache = _FileCacheStub(pickle.dumps({
-        "version": 1, "items": {"[音乐]legacy": {"expires_at": 2000, "value": _music_info().to_dict()}},
+        "version": version, "items": {"[音乐]legacy": {"expires_at": 2000, "value": _music_info().to_dict()}},
     }))
     runtime_cache = _TTLCacheStub()
     _build_initialized_music_cache(monkeypatch, file_cache, runtime_cache)
@@ -531,3 +532,25 @@ def test_shared_recognition_replaces_entity_scoped_negative_cache(async_mode):
     assert result is True
     assert cache.get(meta, music_type="recording").media_id == "rec-1"
     assert cache.get(meta).media_id == "rec-1"
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("isrc_identity", [False, True])
+def test_cached_recording_rechecks_explicit_version_conflicts(monkeypatch, async_mode, isrc_identity):
+    """旧正缓存不能绕过版本冲突确认；已核验的同一 ISRC 则保留身份优先级。"""
+    cache = _build_music_cache({})
+    module = _build_module_with_cache(cache)
+    isrc = "USABC2600001" if isrc_identity else None
+    meta = MetaMusic(title="Example Work", artists=["Artist"], version="Live 2001-05-02", isrc=isrc)
+    cached = _music_info(title="Example Work", artists=["Artist"], version="Live 2001-05-03", isrc=isrc)
+    fresh = _music_info(title="Example Work", artists=["Artist"], version=meta.version, media_id="fresh")
+    cache.update(meta, cached, music_type="recording")
+    monkeypatch.setattr(module, "_search_recordings", Mock(return_value=[fresh]))
+    monkeypatch.setattr(module, "_async_search_recordings", AsyncMock(return_value=[fresh]))
+    if async_mode:
+        result = asyncio.run(module.async_recognize_media(meta=meta, music_type="recording"))
+        assert module._async_search_recordings.await_count == (0 if isrc_identity else 1)
+    else:
+        result = module.recognize_media(meta=meta, music_type="recording")
+        assert module._search_recordings.call_count == (0 if isrc_identity else 1)
+    assert result.media_id == (cached.media_id if isrc_identity else fresh.media_id)

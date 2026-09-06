@@ -13,7 +13,7 @@ from app.domain.context import Context, MusicAlbumInfo, MusicInfo
 from app.domain.meta.metamusic import MetaMusic
 from app.domain.meta.runtime import get_metainfo_accelerator
 from app.domain.metainfo import MetaInfo, MetaInfoPath
-from app.domain.music import match_music_resource
+from app.domain.music import match_music_resource, music_isrc_matches, music_version_matches
 from app.schemas.music import MusicMeta
 from app.schemas.types import MediaType
 
@@ -22,6 +22,36 @@ from app.schemas.types import MediaType
 def test_music_match_rejects_other_titles(title):
     """短曲名不能将较长的另一首作品判为同一单曲。"""
     assert match_music_resource(MusicInfo(title="One", artists=["U2"]), title).status == "rejected"
+
+
+@pytest.mark.parametrize("artist,title,wrong_title", [
+    ("Lee", "Leeway", "way"),
+    ("Rise", "Surprise", "Surp"),
+    ("Lee", "HappyLee", "Happy"),
+    ("Élan", "Élansong", "song"),
+    ("Мир", "Мирный", "ный"),
+])
+def test_artist_affix_cannot_cut_into_a_title_word(artist, title, wrong_title):
+    """署名恰好是单词的一部分时，不得据此构造另一首歌的名称。"""
+    resource = f"{artist} - {title} FLAC"
+    assert match_music_resource(MusicInfo(title=title, artists=[artist]), resource).status == "exact"
+    assert match_music_resource(MusicInfo(title=wrong_title, artists=[artist]), resource).status == "rejected"
+
+
+@pytest.mark.parametrize("title", ["Lee - Song", "Song - Lee", "LEE: Song"])
+def test_artist_affix_preserves_explicit_signature_boundaries(title):
+    """已解析字段中的完整署名有分隔符时，仍可去掉署名参与匹配。"""
+    target = MusicInfo(title="Song", artists=["Lee"])
+    meta = MetaMusic(title=title, artists=["Lee"])
+    assert match_music_resource(target, title, meta=meta).status == "exact"
+
+
+def test_artist_affix_supports_existing_cjk_signature_style():
+    """中文连写及“的”字署名形式仍参与同一套资源名称比较。"""
+    target = MusicInfo(title="爱情电影主题曲", artists=["许茹芸"])
+    for title in ("许茹芸爱情电影主题曲", "许茹芸的爱情电影主题曲"):
+        meta = MetaMusic(title=title, artists=["许茹芸"])
+        assert match_music_resource(target, title, meta=meta).status == "exact"
 
 
 @pytest.mark.parametrize("artist", ["Jay Chou", "周杰倫"])
@@ -132,6 +162,45 @@ def test_resource_title_version_has_priority_over_subtitle():
     """标题版本已有明确证据时，冲突副标题不能覆盖；艺人字段也不是版本声明。"""
     assert MetaMusic.parse_resource("U2 - One (Live) FLAC", "版本：Remix").version == "Live"
     assert MetaMusic.parse_resource("Song FLAC", "艺术家：Live").version is None
+
+
+@pytest.mark.parametrize("expected,actual,matched", [
+    ("Live 1999", "Live 2000", False),
+    ("Live 1999-01-02", "Live 1999.01.03", False),
+    ("Live 1999-01-02", "Live 1999/1/2", True),
+    ("Live 1999", "Live 1999-01-02", True),
+    ("Live", "Live 1999", True),
+    ("Live 1999", "Live", True),
+    ("mix 1999", "mix 2000", False),
+    ("Live 1999-02-31", "Live 1999-03-01", True),
+    ("Ｌｉｖｅ １９９９－０１－０２", "Live 1999-01-02", True),
+    ("Live 1999年1月2日", "Live 1999-01-03", False),
+    ("Live 1999-2001", "Live 2000", True),
+    ("Live 1999-01-01 to 1999-01-03", "Live 1999-01-02", True),
+])
+def test_music_version_checks_only_explicit_conflicting_dates(expected, actual, matched):
+    """同类录音的明确日期或年份冲突仍须排除；缺失、部分日期或非法日期不能凭空补全。"""
+    target = MusicInfo(title="1999", artists=["Artist"], version=expected)
+    meta = MetaMusic(title="1999", artists=["Artist"], version=actual)
+    assert music_version_matches(target, meta) is matched
+
+
+def test_music_resource_rejects_different_dated_live_recording():
+    """版本日期可来自标题括号，不将两场同名现场录音自动绑定成同一作品。"""
+    target = MusicInfo(title="Song (Live 2001-05-02)", artists=["Artist"])
+    assert match_music_resource(target, "Artist - Song (Live 2001-05-03) FLAC").reason == "version_mismatch"
+
+
+@pytest.mark.parametrize("code", [None, "", "Unknown", "N/A", "0", "---", "USABC260001", "UŚABC2600001"])
+def test_invalid_isrc_cannot_be_strong_identity(code):
+    """空值、占位值与格式错误不能因为文本相同而绕过名称和版本匹配。"""
+    assert music_isrc_matches(MusicInfo(isrc=code), MetaMusic(isrc=code)) is False
+
+
+@pytest.mark.parametrize("code", ["USABC2600001", "us-abc-26-00001", "ISRC US-ABC-26-00001"])
+def test_valid_isrc_accepts_standard_display_format(code):
+    """标准代码、大小写和用于展示的前缀分隔格式应指向同一录音身份。"""
+    assert music_isrc_matches(MusicInfo(isrc="USABC2600001"), MetaMusic(isrc=code)) is True
 
 
 @pytest.mark.parametrize("mtype,suffix", [(MediaType.MUSIC, " FLAC"), (None, ".flac")])

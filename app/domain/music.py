@@ -2,6 +2,7 @@
 
 import re
 from dataclasses import dataclass
+from datetime import date
 from typing import Iterable, Literal, Optional
 from unicodedata import combining, normalize
 
@@ -33,6 +34,10 @@ _BARE_VERSION_SUFFIX = re.compile(
 )
 _TITLE_LABEL = re.compile(r"^(?:专辑(?:名|名称)?|專輯(?:名|名稱)?|曲名|歌曲|album|title)\s*[:：]\s*", re.I)
 _COLLECTIVE_ARTISTS = ("Various Artists", "Various", "VA", "群星", "众艺人", "眾藝人")
+_VERSION_YEAR = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)")
+_VERSION_DATE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?:[-./]|年)\s*(\d{1,2})(?:[-./]|月)\s*(\d{1,2})日?(?!\d)")
+_ISRC = re.compile(r"[A-Z]{2}[A-Z0-9]{3}[0-9]{7}", re.IGNORECASE | re.ASCII)
+_CJK = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,16 +100,66 @@ def music_artist_matches(music: MusicInfo, parsed_artists: Iterable[str]) -> boo
     return bool(keys & {music_text_key(artist) for artist in artists})
 
 
-def music_base_title(value: Optional[str]) -> str:
-    """仅剥离已知发行版本后缀，保留未知括号和属于作品本身的文字。"""
-    text = _VERSION_SUFFIX.sub("", _EDITION.sub("", str(value or "")))
-    return _BARE_VERSION_SUFFIX.sub("", text).strip()
+def music_base_title(value: Optional[str], *, preserve_editions: bool = False) -> str:
+    """剥离已知版本后缀；数据源可保留发行版标签，不改变未知括号中的作品名。"""
+    text = str(value or "")
+    if not preserve_editions:
+        text = _EDITION.sub("", text)
+
+    def strip_version(match: re.Match[str]) -> str:
+        """保留发行版声明，避免被包含它的录音版本标签一并删除。"""
+        return match.group(0) if preserve_editions and _EDITION.search(match.group(0)) else ""
+
+    return _BARE_VERSION_SUFFIX.sub(strip_version, _VERSION_SUFFIX.sub(strip_version, text)).strip()
+
+
+def music_title_matches(music: MusicInfo, title: Optional[str], *, preserve_editions: bool = False) -> bool:
+    """统一全半角后比较完整名称及别名，允许数据源保持既有发行版本边界。"""
+    expected = music_text_key(music_base_title(normalize("NFKC", str(title or "")), preserve_editions=preserve_editions))
+    return bool(expected and any(
+        expected == music_text_key(music_base_title(normalize("NFKC", name), preserve_editions=preserve_editions))
+        for name in music_titles(music)
+    ))
+
+
+def _isrc_key(value: Optional[str]) -> Optional[str]:
+    """校验 12 位 ISRC 结构，兼容展示前缀、空白和分隔符，不接受占位值。"""
+    code = re.sub(r"[\s-]+", "", str(value or ""))
+    if not _ISRC.fullmatch(code) and code[:4].lower() == "isrc":
+        code = code[4:].lstrip(":")
+    return code.upper() if _ISRC.fullmatch(code) else None
+
+
+def music_isrc_matches(music: MusicInfo, meta: MetaMusic) -> bool:
+    """只有格式有效且相同的 ISRC 才能作为优先于文本匹配的录音身份。"""
+    expected = _isrc_key(meta.isrc)
+    return bool(expected and expected == _isrc_key(music.isrc))
+
+
+def _artist_match_text(text: str) -> str:
+    """归一署名比较文本但保留分隔符，避免紧凑名称丢失单词边界。"""
+    normalized = str(zhconv_convert(normalize("NFKD", text).casefold(), "zh-hans"))
+    return "".join(char for char in normalized if not combining(char))
+
+
+def music_artist_affix_matches(title: str, artist: str, *, suffix: bool = False) -> bool:
+    """核验首尾完整署名；保留中日韩连写习惯，但不能截断其它文字的单词。"""
+    key = music_text_key(artist)
+    if not key:
+        return False
+    text = _artist_match_text(title)
+    pattern = r"[\W_]*".join(re.escape(char) for char in key)
+    match = re.search(rf"{pattern}[\W_]*$" if suffix else rf"^[\W_]*{pattern}", text)
+    if not match:
+        return False
+    neighbor = text[match.start() - 1:match.start()] if suffix else text[match.end():match.end() + 1]
+    edge = key[0] if suffix else key[-1]
+    return not (neighbor.isalnum() and edge.isalnum() and not _CJK.search(neighbor + edge))
 
 
 def _contains_artist(text: str, artist: str) -> bool:
     """匹配完整署名，避免短拉丁艺名命中另一个人名的子串。"""
-    normalized = str(zhconv_convert(normalize("NFKD", text).casefold(), "zh-hans"))
-    normalized = "".join(char for char in normalized if not combining(char))
+    normalized = _artist_match_text(text)
     key = music_text_key(artist)
     if not key:
         return False
@@ -116,7 +171,7 @@ def _resource_names(primary: MetaMusic, artists: list[str], *, album: bool = Fal
                     album_suffixes: Optional[list[str]] = None) -> list[str]:
     """复用音乐命名解析器提取作品片段，去掉已确认的首尾艺术家署名。"""
     names: list[str] = []
-    artist_keys = [music_text_key(item) for item in artists if item]
+    artist_keys = [(item, music_text_key(item)) for item in artists if item]
     suffix_keys = {music_text_key(item) for item in album_suffixes or []}
     for value in (primary.title, primary.album if album else None):
         if not value:
@@ -127,21 +182,41 @@ def _resource_names(primary: MetaMusic, artists: list[str], *, album: bool = Fal
         if len(parts) > 1 and all(music_text_key(part) in suffix_keys for part in parts[1:]):
             variants.append(parts[0])
         for part in variants:
-            key = music_text_key(music_base_title(_TITLE_LABEL.sub("", part.strip())))
+            name = music_base_title(_TITLE_LABEL.sub("", part.strip()))
+            key = music_text_key(name)
             if not key:
                 continue
             names.append(key)
-            for artist in artist_keys:
-                if key.startswith(artist) and key != artist:
-                    names.append(key[len(artist):])
-                if key.endswith(artist) and key != artist:
-                    names.append(key[:-len(artist)])
+            for artist, artist_key in artist_keys:
+                if key.startswith(artist_key) and key != artist_key and music_artist_affix_matches(name, artist):
+                    remainder = re.sub(r"^[的之]", "", key[len(artist_key):])
+                    if remainder:
+                        names.append(remainder)
+                if key.endswith(artist_key) and key != artist_key and music_artist_affix_matches(name, artist, suffix=True):
+                    names.append(key[:-len(artist_key)])
     return names
 
 
 def _version_markers(text: str) -> set[str]:
     """识别会改变录音身份的版本标记，普通发行后缀单独处理。"""
-    return {name for name, pattern in _VERSIONS.items() if re.search(pattern, text, re.I)}
+    normalized = normalize("NFKC", text)
+    return {name for name, pattern in _VERSIONS.items() if re.search(pattern, normalized, re.I)}
+
+
+def _version_dates(title: Optional[str], version: Optional[str]) -> tuple[set[int], set[date]]:
+    """只提取明确版本字段及版本后缀中的日期，不把数字作品名或发行年份当作录制日期。"""
+    title_text = normalize("NFKC", str(title or ""))
+    text = normalize("NFKC", " ".join([
+        str(version or ""), *_VERSION_SUFFIX.findall(title_text), *_BARE_VERSION_SUFFIX.findall(title_text),
+    ]))
+    years = {int(year) for year in _VERSION_YEAR.findall(text)}
+    dates: set[date] = set()
+    for match in _VERSION_DATE.finditer(text):
+        try:
+            dates.add(date(*(int(value) for value in match.groups())))
+        except ValueError:
+            continue
+    return years, dates
 
 
 def music_version_matches(music: MusicInfo, meta: MetaMusic) -> bool:
@@ -150,7 +225,14 @@ def music_version_matches(music: MusicInfo, meta: MetaMusic) -> bool:
     # 专辑类型描述整专版本，但单曲的所属专辑类型不能代替该录音自身的版本。
     album_versions = " ".join(music.secondary_types or []) if music.music_type == MUSIC_ENTITY_ALBUM else ""
     expected = _version_markers(f"{target_title or ''} {music.version or ''} {album_versions}")
-    return expected == _version_markers(f"{meta.title or ''} {meta.version or ''}")
+    if expected != _version_markers(f"{meta.title or ''} {meta.version or ''}"):
+        return False
+    expected_years, expected_dates = _version_dates(target_title, music.version)
+    actual_years, actual_dates = _version_dates(meta.title, meta.version)
+    # 多个时间值可能描述区间或重发记录，不能当作唯一录制时间互斥比较。
+    if len(expected_dates) == len(actual_dates) == 1 and expected_dates != actual_dates:
+        return False
+    return not (len(expected_years) == len(actual_years) == 1 and expected_years != actual_years)
 
 
 def match_music_resource(
@@ -171,7 +253,7 @@ def match_music_resource(
     names = _resource_names(resource, artists, album=music.music_type == MUSIC_ENTITY_ALBUM,
                             album_suffixes=albums if music.music_type != MUSIC_ENTITY_ALBUM else None)
     titles = music_titles(music)
-    title_matched = any(music_text_key(music_base_title(item)) in names for item in titles)
+    title_matched = any(music_title_matches(music, name) for name in names)
     content = f"{title} {description}"
     artist_matched = music_artist_matches(music, resource.artists) if resource.artists \
         else any(_contains_artist(content, artist) for artist in artists)

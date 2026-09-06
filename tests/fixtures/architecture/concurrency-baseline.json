@@ -588,11 +588,11 @@
     },
     "target": "asyncio.to_thread"
   },
-  "app/runtime/state.py:threading.Thread": {
+  "app/runtime/state.py:threading.Timer": {
     "owners": {
-      "SystemHelper._start_graceful_shutdown_monitor": 1
+      "SystemHelper._schedule_supervisor_restart": 1
     },
-    "target": "threading.Thread"
+    "target": "threading.Timer"
   },
   "app/runtime/tasks.py:asyncio.create_task": {
     "owners": {
