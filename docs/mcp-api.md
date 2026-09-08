@@ -45,7 +45,7 @@ MCP 当前不会主动发送工具列表变更通知（`listChanged=false`）。
 | :--- | :--- | :--- |
 | `moviepilot_api` | MoviePilot 产品业务 API：媒体、搜索、订阅、下载、整理、站点、存储、调度、工作流、插件、过滤规则和系统配置 | `skills/moviepilot-api/SKILL.md`；运行时 schema 为 `app/agent/policy/resources/api_mcp_schema.json` |
 | `downloader_operation` | qBittorrent、Transmission、rTorrent 原生任务、队列、文件、限速、标签和会话操作 | `skills/downloader-operation/SKILL.md` 与 `skills/downloader-operation/scripts/mp-downloader.py` 的 `ACTIONS` |
-| `mediaserver_operation` | Emby、Jellyfin、Plex、ZSpace、UGREEN、TrimeMedia、Navidrome 原生媒体库、搜索、播放、扫描和刷新操作 | `skills/mediaserver-operation/SKILL.md` 与 `skills/mediaserver-operation/scripts/mp-mediaserver.py` 的 `ACTIONS` |
+| `mediaserver_operation` | Emby、Jellyfin、Plex、ZSpace、UGREEN、TrimeMedia、Navidrome、MediaVault 原生媒体库、搜索、播放、扫描和刷新操作 | `skills/mediaserver-operation/SKILL.md` 与 `skills/mediaserver-operation/scripts/mp-mediaserver.py` 的 `ACTIONS` |
 | `database_operation` | MoviePilot 配置数据库表清单、实时 schema、只读 SQL 和明确授权写入 | `skills/database-operation/SKILL.md` 与 `skills/database-operation/scripts/mp-db.py` 的 `ACTIONS` |
 
 这四个工具都要求管理员级 MCP 集成身份；`tools/list` 的可见性不等于绕过业务权限或写操作确认。下载器和媒体服务器工具会在一次调用内自动选择默认/唯一实例；实例不明确时，错误结果会列出可复用的精确实例名。数据库工具不接受任意连接串或凭据，脚本从 MoviePilot 运行时配置读取数据库连接。
@@ -253,11 +253,11 @@ FastAPI 的 HTTP 异常和参数校验异常统一使用 `message`，不再返�
 
 #### 系统更新
 
-系统 Release 更新采用“检查、后台下载、确认安装”三阶段流程，以下接口均要求超级管理员登录态。后台每 6 小时自动检查一次稳定版 v3 GitHub Release 和站点资源包；升级类型只有 `application`（主程序，前端版本由后端 Release 中的 `version.py` 决定）与 `resources`（认证资源和索引资源）。下载完成前不重启服务，安装接口只消费已下载并校验的完整制品，启动器会先应用主程序包，再应用资源包，之后才启动进程；启动后的初始化不会再次下载或触发资源重启。原 Dev 更新入口继续保留，但 `/system/upgrade` 只接受请求体 `"dev"`，不再处理 Release 更新。
+系统 Release 更新采用“检查、后台下载、确认安装”三阶段流程，以下接口均要求超级管理员登录态。后台每 6 小时按独立开关检查更新：`MOVIEPILOT_AUTO_UPDATE=true` 检查稳定版 v3 GitHub Release，`AUTO_UPDATE_RESOURCE=true` 检查站点资源包，并分别提示升级。任一开关开启即启用定时服务；两者均关闭时移除定时服务并隐藏版本提醒。手动检查、下载和安装仍可用。独立布尔配置 `MOVIEPILOT_UPDATE_DEV` 控制启动时跟踪 Dev 分支；升级类型只有 `application`（主程序，前端版本由后端 Release 中的 `version.py` 决定）与 `resources`（认证资源和索引资源）。下载完成前不重启服务，安装接口只消费已下载并校验的完整制品，启动器会先应用主程序包，再应用资源包，之后才启动进程；启动后的初始化不会再次下载或触发资源重启。原 Dev 更新入口继续保留，但 `/system/upgrade` 只接受请求体 `"dev"`，不再处理 Release 更新。
 
 | 方法 | 路径 | 说明 |
 | :--- | :--- | :--- |
-| GET | `/api/v1/system/update/status` | 查询聚合状态及 `updates` 中两类升级明细的 `idle`、`available`、`downloading`、`ready`、`installing` 或 `failed` 状态，以及版本、字节数和进度 |
+| GET | `/api/v1/system/update/status` | 查询聚合状态、实时提醒开关 `auto_update` / `auto_update_resource` 及 `updates` 中两类升级明细的 `idle`、`available`、`downloading`、`ready`、`installing` 或 `failed` 状态，以及版本、字节数和进度 |
 | POST | `/api/v1/system/update/check` | 立即检查最新稳定版 v3 Release 和当前平台站点资源包 |
 | POST | `/api/v1/system/update/download` | 请求体可传 `{"target":"application"}` 或 `{"target":"resources"}`；后台下载并校验对应制品 |
 | POST | `/api/v1/system/update/install` | 请求体可传 `{"target":"application"}` 或 `{"target":"resources"}`；再次校验对应制品，写入安装意图并重启 |
@@ -265,7 +265,9 @@ FastAPI 的 HTTP 异常和参数校验异常统一使用 `message`，不再返�
 
 #### 媒体识别 / 整理
 
-媒体识别、搜索和手动整理统一使用 `media_source` + `media_id` 表示媒体主身份。内置来源通过 `MediaSource` 提供 `themoviedb`、`douban`、`bangumi`、`anilist`、`imdb`、`tvdb`、`musicbrainz`、`theaudiodb`、`doubanmusic`、`bilibili`、`mangguodiscover`、`migu` 和 `tencentvideodiscover` 等常量；该列表不是插件来源白名单，插件可以注册符合 OpenAPI 格式约束的稳定扩展标识。`media_id` 是该来源的原生 ID，不添加 `tmdb:` 等前缀。需要精确身份时两个字段必须同时提供，不能只传其中一个。
+媒体识别、搜索和手动整理统一使用 `media_source` + `media_id` 表示媒体主身份。内置来源通过 `MediaSource` 提供 `themoviedb`、`douban`、`bangumi`、`anilist`、`imdb`、`tvdb`、`musicbrainz`、`theaudiodb`、`doubanmusic` 九个具有宿主模块实现的常量；该列表不是插件来源白名单，插件可以注册符合 OpenAPI 格式约束的稳定扩展标识。`media_id` 是该来源的原生 ID，不添加 `tmdb:` 等前缀。需要精确身份时两个字段必须同时提供，不能只传其中一个。
+
+媒体来源列表 `/api/v1/media/source` 仅预置上述九个来源，其余来源由启用插件注册后提供。哔哩哔哩、芒果 TV、咪咕视频、腾讯视频、爱奇艺不再占用内置来源标识，宿主也不再转换这些插件来源的旧别名；调用方应使用插件声明的准确来源 ID。
 
 影视自动识别在未指定来源时只使用 TMDB，未命中时不会继续查询其它影视源。音乐路径识别严格按 AcoustID 音频指纹、文件标签、文件名三级依次执行；指纹或标签直接提供 MusicBrainz Recording ID 时，会直接查询 MusicBrainz 详情，标签和文件名标题识别也只使用 MusicBrainz。其它元数据源仅在手动操作通过请求级 `media_source`，或通过完整的 `media_source` + `media_id` 精确指定时使用，不修改系统默认值，也不会跨来源兜底。`MediaInfo` 响应仍可能包含 `tmdb_id`、`douban_id`、`bangumi_id`、`anilist_id` 等跨源映射辅助字段，但这些字段不是通用请求入口。明确归属 `/tmdb`、`/douban`、`/bangumi`、`/anilist` 的接口，以及固定使用 TMDB 的剧集组和排期接口，仍可按其单数据源契约接收原生 ID。
 
@@ -278,7 +280,7 @@ FastAPI 的 HTTP 异常和参数校验异常统一使用 `message`，不再返�
 | POST | `/api/v1/media/scrape/{storage}` | 刮削媒体元数据；请求体为 `FileItem`，可选查询参数 `media_source`、`media_id`、`type_name`（电影/电视剧/音乐）。音乐会按策略处理音频标签、封面和歌词 |
 | POST | `/api/v1/transfer/manual/target-path` | 按源文件与目录配置匹配手动整理目标路径；请求体为 `ManualTransferItem`，该接口不执行媒体识别 |
 | POST | `/api/v1/transfer/manual/history` | 查询文件、批量文件或目录命中的成功整理历史摘要，用于进入手动整理界面时显示重新整理状态 |
-| POST | `/api/v1/transfer/manual` | 手动整理；请求体可用 `media_source` + `media_id` 指定本次识别与刮削数据源；音乐请求未传 `music_type` 时，目录按 `album`、文件按 `recording` 解释；命中失败历史时自动清理旧目标和记录后重试，`reorganize=true` 时清理命中的成功历史和非移动模式旧目标后重新整理 |
+| POST | `/api/v1/transfer/manual` | 手动整理；请求体可用 `media_source` + `media_id` 指定本次识别与刮削数据源；音乐请求未传 `music_type` 时，目录按 `album`、文件按 `recording` 解释；可用最多三项的 `music_release_regions`（ISO 3166-1）和 `music_release_scripts`（ISO 15924）仅覆盖本次 MusicBrainz 发行版本排序，省略时继承系统设置；命中持久失败历史，且未指定媒体身份、未开启 `reorganize` 时，由调度器重试原计划（包括 `logid` 历史入口）；显式重整先校验并放弃确定失败任务，再清理旧目标和记录；旧版失败历史仍清理后重试；`reorganize=true` 时清理命中的成功历史和非移动模式旧目标后重新整理 |
 | GET | `/api/v1/transfer/tasks/manual-reviews` | 管理员分页查询 durable 人工复核任务；`state` 仅允许 `manual_review`（默认）或已经人工判定、等待调度恢复的 `retry_wait`，支持 `page` 与 `page_size`。响应只公开任务、源文件、状态、步骤意图/证据/错误和复核修订号，不返回 lease 或 attempt 身份 |
 | GET | `/api/v1/transfer/tasks/{task_id}/manual-review` | 管理员查询单个 durable 人工复核任务详情；仅可读取 `manual_review` 或已经人工判定的 `retry_wait` 任务，其余状态按不存在处理 |
 | POST | `/api/v1/transfer/tasks/{task_id}/manual-review` | 管理员判定处于 `manual_review` 的 durable 整理步骤；请求包含 `operation_id`、`decision=not_applied|applied`、`reason`，`applied` 还必须提供 `result_payload`。`failed` 不属于公开决策，失败终态只能由持租约的 durable 结算写入；响应仅返回任务、操作、决策、后续状态和复核修订号 |
@@ -421,6 +423,24 @@ TMDB 缓存查询响应的 `data` 包含 `count`、`recognized`、`unrecognized`
 单曲、专辑或未限定实体范围隔离，版本及 ISRC 不同的文本识别请求也不会共用结果；
 旧版未包含这些证据的派生缓存在升级后重新建立，不影响下载历史或订阅数据。
 名称确认规则更新时同样重建旧派生缓存，避免艺术家前后缀误截断的旧结果继续命中。
+
+### 单条订阅搜索周期
+
+`POST /api/v1/subscribe/` 和 `PUT /api/v1/subscribe/` 支持 `search_interval`：
+取值为 1–8760 的整数小时数，`null` 表示跟随系统的 `SUBSCRIBE_SEARCH_INTERVAL`。
+更新时省略该字段保留原值，显式传入 `null` 恢复系统周期。默认订阅规则同样可保存此字段。
+
+仅在启用 `SUBSCRIBE_SEARCH` 时执行定时搜索，每五分钟检查到期订阅，再通过原有搜索队列和站点限流执行；
+实际开始时间可能因站点忙而延后。`last_search` 为系统维护的 UTC 搜索尝试开始时间，重启后仍有效，公共写接口忽略它。
+旧订阅尚无搜索时间时，以添加时间计算到期。新订阅首次搜索、手动搜索和 RSS 刷新不受周期过滤影响；
+手动主动搜索会更新最近搜索时间。电影、电视剧和音乐均支持独立周期。
+
+自动批次只在启动时随机错峰 0–60 秒，不再按订阅数量累加分钟级等待；同站点访问间隔、唯一在途租约和错误冷却继续生效。
+站点暂不可用时，任务保存未完成站点并按 `next_run_at` 恢复，不重复查询已完成站点或插件源；队列和站点游标可跨重启恢复。
+`waiting_site_budget` 表示可恢复等待，`error` 中的“等待站点”或“站点冷却中”是原因提示，不表示搜索失败；重新执行时清除旧提示。
+卡片应按 `state` / `phase` 展示简短标签，原因放入详情提示。恢复调度每 10 秒检查空闲消费者，长搜索由调度器持续托管。
+实际吞吐仍受站点访问限制和网络响应时间影响，配置周期不是全部站点必须完成的截止时间。
+
 
 ### 插件补充接口
 
@@ -690,3 +710,11 @@ description、aliases、instructions，或通过 `append_instructions` 追加规
   }
 }
 ```
+
+
+### 分类条件字段字典
+
+`GET /api/v1/classification/fields` 的 `fields` 与 `retired_fields` 使用同一字段目录 schema：
+`options` 提供来源无关的 `{value, label}`，`source_options` 按数据源 ID 提供开放候选。国家与语言显示中文名称，规则保存标准代码；风格保存与分类事实归一化共用的稳定键。来源风格和音乐枚举保留原始大小写。
+
+客户端合并通用选项和所选来源的候选；未限制来源时展示全部候选并标注来源。`allow_custom_values` 为真时允许输入其他值，切换来源不得清空已有条件。`source_options` 缺失等价于空目录；候选是录入辅助，不改变来源支持等级或规则校验范围。公司、平台和用户标签等开放字段应使用媒体预览中的原值。
