@@ -129,6 +129,9 @@ class PluginActionEventData(ExtensibleEventData):
     channel: Optional[str] = Field(default=None, description="消息渠道")
     source: Optional[str] = Field(default=None, description="消息来源")
     user: Optional[Any] = Field(default=None, description="发起用户")
+    is_channel_admin: Optional[bool] = Field(default=None, description="渠道管理员事实")
+    original_message_id: Optional[Any] = Field(default=None, description="原消息 ID")
+    original_chat_id: Optional[Any] = Field(default=None, description="原消息会话 ID")
 
 
 class PluginTriggeredEventData(ExtensibleEventData):
@@ -146,6 +149,9 @@ class CommandExecuteEventData(ExtensibleEventData):
     user: Optional[Any] = Field(default=None, description="发起用户")
     channel: Optional[str] = Field(default=None, description="消息渠道")
     source: Optional[str] = Field(default=None, description="消息来源")
+    is_channel_admin: Optional[bool] = Field(default=None, description="渠道管理员事实")
+    original_message_id: Optional[Any] = Field(default=None, description="原消息 ID")
+    original_chat_id: Optional[Any] = Field(default=None, description="原消息会话 ID")
     processing_status: Optional[Any] = Field(default=None, description="交互处理状态")
 
 
@@ -235,9 +241,13 @@ class MessageActionEventData(ExtensibleEventData):
     text: Optional[str] = Field(default=None, description="兼容动作文本")
     input_text: Optional[str] = Field(default=None, description="用户输入文本")
     userid: Optional[Any] = Field(default=None, description="用户 ID")
+    username: Optional[Any] = Field(default=None, description="用户名")
     channel: Optional[str] = Field(default=None, description="消息渠道")
     source: Optional[str] = Field(default=None, description="消息来源")
+    is_channel_admin: Optional[bool] = Field(default=None, description="渠道管理员事实")
     input_session_id: Optional[str] = Field(default=None, description="输入会话 ID")
+    original_message_id: Optional[Any] = Field(default=None, description="原消息 ID")
+    original_chat_id: Optional[Any] = Field(default=None, description="原消息会话 ID")
     payload: Any = Field(default=None, description="插件自定义交互数据")
 
 

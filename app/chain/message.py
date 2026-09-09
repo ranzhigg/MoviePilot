@@ -524,6 +524,9 @@ class MessageChain(ChainBase):
                     "user": userid,
                     "channel": channel,
                     "source": source,
+                    "is_channel_admin": is_channel_admin,
+                    "original_message_id": original_message_id,
+                    "original_chat_id": original_chat_id,
                     "processing_status": processing_status.to_dict()
                     if processing_status
                     else None,
@@ -763,8 +766,10 @@ class MessageChain(ChainBase):
                     "plugin_id": plugin_id,
                     "text": content,
                     "userid": context.user_id,
+                    "username": context.username,
                     "channel": context.channel,
                     "source": context.source,
+                    "is_channel_admin": context.is_channel_admin,
                     "original_message_id": context.original_message_id,
                     "original_chat_id": context.original_chat_id,
                 },

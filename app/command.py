@@ -303,6 +303,9 @@ class Command(metaclass=Singleton):
         channel: NotificationChannel = None,
         source: Optional[str] = None,
         userid: Union[str, int] = None,
+        is_channel_admin: Optional[bool] = None,
+        original_message_id: Optional[Union[str, int]] = None,
+        original_chat_id: Optional[str] = None,
     ):
         """
         运行定时服务
@@ -342,6 +345,9 @@ class Command(metaclass=Singleton):
                     data["channel"] = channel
                     data["source"] = source
                     data["user"] = userid
+                    data["is_channel_admin"] = is_channel_admin
+                    data["original_message_id"] = original_message_id
+                    data["original_chat_id"] = original_chat_id
                     if data_str:
                         data["arg_str"] = data_str
                     cmd_data["data"] = data
@@ -404,6 +410,9 @@ class Command(metaclass=Singleton):
         channel: NotificationChannel = None,
         source: Optional[str] = None,
         userid: Union[str, int] = None,
+        is_channel_admin: Optional[bool] = None,
+        original_message_id: Optional[Union[str, int]] = None,
+        original_chat_id: Optional[str] = None,
     ) -> None:
         """
         执行命令
@@ -425,6 +434,9 @@ class Command(metaclass=Singleton):
                     channel=channel,
                     source=source,
                     userid=userid,
+                    is_channel_admin=is_channel_admin,
+                    original_message_id=original_message_id,
+                    original_chat_id=original_chat_id,
                 )
 
                 if userid:
@@ -462,6 +474,10 @@ class Command(metaclass=Singleton):
         event_source = event.event_data.get("source")
         # 消息用户
         event_user = event.event_data.get("user")
+        # 渠道管理员事实和原消息会话，用于插件权限及群聊回复
+        event_is_channel_admin = event.event_data.get("is_channel_admin")
+        event_original_message_id = event.event_data.get("original_message_id")
+        event_original_chat_id = event.event_data.get("original_chat_id")
         try:
             if event_str:
                 cmd = event_str.split()[0]
@@ -473,6 +489,9 @@ class Command(metaclass=Singleton):
                         channel=event_channel,
                         source=event_source,
                         userid=event_user,
+                        is_channel_admin=event_is_channel_admin,
+                        original_message_id=event_original_message_id,
+                        original_chat_id=event_original_chat_id,
                     )
         finally:
             _finish_command_processing_status(
