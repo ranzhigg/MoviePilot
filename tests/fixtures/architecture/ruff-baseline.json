@@ -17,9 +17,6 @@
   "app/agent/llm/tools.py": {
     "I001": 1
   },
-  "app/agent/loader.py": {
-    "I001": 1
-  },
   "app/agent/middleware/memory.py": {
     "I001": 1
   },
@@ -33,12 +30,6 @@
     "I001": 1
   },
   "app/agent/tools/impl/ask_user_choice.py": {
-    "I001": 1
-  },
-  "app/agent/tools/impl/browse_webpage.py": {
-    "I001": 1
-  },
-  "app/agent/tools/impl/recognize_captcha.py": {
     "I001": 1
   },
   "app/agent/tools/impl/send_local_file.py": {
@@ -119,9 +110,6 @@
   "app/db/uow.py": {
     "I001": 1
   },
-  "app/db/worker.py": {
-    "I001": 1
-  },
   "app/doctor/__init__.py": {
     "I001": 1
   },
@@ -165,9 +153,6 @@
     "I001": 1
   },
   "app/domain/scraper.py": {
-    "I001": 1
-  },
-  "app/domain/site.py": {
     "I001": 1
   },
   "app/domain/title.py": {
@@ -219,9 +204,6 @@
   },
   "app/modules/emby/emby.py": {
     "F541": 33,
-    "I001": 1
-  },
-  "app/modules/fanart/__init__.py": {
     "I001": 1
   },
   "app/modules/feishu/__init__.py": {
@@ -312,9 +294,6 @@
     "I001": 1
   },
   "app/modules/listenbrainz/__init__.py": {
-    "I001": 1
-  },
-  "app/modules/lrclib/__init__.py": {
     "I001": 1
   },
   "app/modules/navidrome/__init__.py": {
@@ -447,9 +426,6 @@
   "app/monitor/__init__.py": {
     "I001": 1
   },
-  "app/monitor/monitor.py": {
-    "I001": 1
-  },
   "app/monitor/poller.py": {
     "I001": 1
   },
@@ -480,16 +456,7 @@
   "app/runtime/execution.py": {
     "I001": 1
   },
-  "app/runtime/extensions/module/adapter.py": {
-    "I001": 1
-  },
-  "app/runtime/extensions/module/manager.py": {
-    "I001": 1
-  },
   "app/runtime/extensions/plugin/loader.py": {
-    "I001": 1
-  },
-  "app/runtime/extensions/plugin/storage.py": {
     "I001": 1
   },
   "app/runtime/gc.py": {
@@ -516,9 +483,6 @@
   "app/schemas/message.py": {
     "I001": 1
   },
-  "app/schemas/types.py": {
-    "I001": 1
-  },
   "app/sdk/_legacy/user.py": {
     "I001": 1
   },
@@ -532,9 +496,6 @@
     "I001": 1
   },
   "app/sdk/network.py": {
-    "I001": 1
-  },
-  "app/sdk/plugins.py": {
     "I001": 1
   },
   "app/sdk/services.py": {
@@ -602,9 +563,6 @@
   "tests/test_agent_llm_capability.py": {
     "I001": 1
   },
-  "tests/test_agent_recognize_captcha_tool.py": {
-    "I001": 1
-  },
   "tests/test_agent_session_status.py": {
     "I001": 1
   },
@@ -612,9 +570,6 @@
     "I001": 1
   },
   "tests/test_agent_tokens_events.py": {
-    "I001": 1
-  },
-  "tests/test_agent_tool_result_policy.py": {
     "I001": 1
   },
   "tests/test_agent_tool_timeouts.py": {
@@ -679,14 +634,7 @@
     "I001": 1
   },
   "tests/test_episode_format_helper.py": {
-    "F841": 1,
-    "I001": 1
-  },
-  "tests/test_event_dispatch_snapshot.py": {
-    "I001": 1
-  },
-  "tests/test_execute_command_tool.py": {
-    "I001": 1
+    "F841": 1
   },
   "tests/test_extensible_media_source_migration.py": {
     "I001": 1
@@ -789,9 +737,6 @@
     "I001": 1
   },
   "tests/test_metainfo.py": {
-    "I001": 1
-  },
-  "tests/test_metamusic.py": {
     "I001": 1
   },
   "tests/test_module_quality.py": {
@@ -915,9 +860,6 @@
   "tests/test_system_database_backup_api.py": {
     "I001": 1
   },
-  "tests/test_system_i18n.py": {
-    "I001": 1
-  },
   "tests/test_system_notification_dispatch.py": {
     "E402": 5,
     "I001": 2
@@ -962,9 +904,6 @@
     "I001": 1
   },
   "tests/test_transfer_download_history_oper_sessions.py": {
-    "I001": 1
-  },
-  "tests/test_transfer_history_retransfer.py": {
     "I001": 1
   },
   "tests/test_transfer_rename_build_event.py": {

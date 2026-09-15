@@ -460,6 +460,7 @@ def test_application_classification_uses_same_named_package() -> None:
         "execution.py",
         "legacy.py",
         "migration.py",
+        "compiler.py",
         "projection.py",
         "reference.py",
         "runtime.py",
@@ -1207,6 +1208,26 @@ def test_host_uses_canonical_workflow_manager_name():
             violations.append(str(path.relative_to(PROJECT_ROOT)))
 
     assert violations == []
+
+
+def test_plugin_route_refresh_is_imported_from_its_application_owner():
+    """插件路由刷新只有 Application 一个拥有者，端点之间不得互相取用它。"""
+    owner = "app.application.plugin.routes"
+    violations: dict[str, str] = {}
+    for path in APP_ROOT.rglob("*.py"):
+        relative = path.relative_to(APP_ROOT)
+        if relative.parts[0] == "plugins":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.level:
+                continue
+            if node.module == owner:
+                continue
+            if any(alias.name == "register_plugin_api" for alias in node.names):
+                violations[str(relative)] = node.module or ""
+
+    assert violations == {}
 
 
 def test_startup_root_contains_only_composition_packages():

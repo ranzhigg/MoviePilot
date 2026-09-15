@@ -22,6 +22,7 @@ from app.runtime.settings import get_runtime_setting
 
 __all__ = [
     "destroy_database",
+    "database_handles",
     "ensure_database",
     "get_database",
     "release_all_databases",
@@ -77,6 +78,17 @@ def _build_handle(plugin_id: str) -> PluginDatabaseHandle:
         host_engine = get_engine()
         with host_engine.begin() as connection:
             connection.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+            allowed = connection.execute(
+                text(
+                    "SELECT has_schema_privilege(current_user, :schema, 'USAGE') "
+                    "AND has_schema_privilege(current_user, :schema, 'CREATE')"
+                ),
+                {"schema": schema},
+            ).scalar()
+            if not allowed:
+                raise PermissionError(
+                    f"数据库账号无权使用或写入插件 schema：{schema}"
+                )
         engine = host_engine.execution_options(schema_translate_map={None: schema})
         # 监听器只挂在派生引擎上：OptionEngine 自带 dispatch，仅单向 _join 宿主引擎已有
         # 的监听器，宿主与其它插件的连接不会因此改变解析根
@@ -187,10 +199,18 @@ def ensure_database(
         # 插件不为它付出导入代价
         from app.db.plugin.migration import run_migrations
 
-        run_migrations(get_database(plugin_id), migrations)
+        handle = get_database(plugin_id)
+        run_migrations(handle, migrations)
         return
     if models:
-        _create_declared_tables(get_database(plugin_id), models)
+        handle = get_database(plugin_id)
+        _create_declared_tables(handle, models)
+
+
+def database_handles() -> tuple[PluginDatabaseHandle, ...]:
+    """返回当前已建立的插件数据库句柄快照。"""
+    with _lock:
+        return tuple(_handles.values())
 
 
 def release_database(plugin_id: str) -> None:
@@ -245,7 +265,13 @@ def _remove_storage(plugin_id: str, handle: PluginDatabaseHandle | None) -> None
         _drop_schema(plugin_id, schema)
         return
 
-    db_path = (handle.db_path if handle else None) or sqlite_database_path(plugin_id)
+    try:
+        db_path = (handle.db_path if handle else None) or sqlite_database_path(plugin_id)
+    except ValueError as error:
+        # 标识越界时没有「该插件的库」可言，删除请求本身就是伪造的；与其它删除失败
+        # 同样只记日志：销毁是一次收尾操作，抛出只会把调用方的收尾流程整条打断
+        logger.warning(f"拒绝按非法插件标识 {plugin_id!r} 删除数据库文件：{error}")
+        return
     for candidate in (db_path, *sqlite_sidecar_paths(db_path)):
         try:
             candidate.unlink(missing_ok=True)

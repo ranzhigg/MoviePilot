@@ -3,10 +3,11 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from app.domain.context import MUSIC_ENTITY_ALBUM, MUSIC_ENTITY_RECORDING, MusicInfo
+from app.domain.context import MUSIC_ENTITY_ALBUM, MUSIC_ENTITY_RECORDING, MusicArtistInfo, MusicInfo
 from app.domain.meta.metamusic import MetaMusic
 from app.modules.musicbrainz import MusicBrainzModule
 from app.runtime.config import settings
+from app.schemas.types import MediaSource
 
 
 def test_recording_search_uses_phrase_before_character_fallback(monkeypatch):
@@ -288,6 +289,36 @@ def test_search_music_normalizes_candidates(monkeypatch):
     assert results[0].title == "晴天"
 
 
+def test_search_persons_returns_musicbrainz_artist_infos_in_async_and_sync_modes(monkeypatch):
+    """人物搜索新增 MusicBrainz 来源时应保留标准艺术家字段，并支持两种 IO 模式。"""
+    module = MusicBrainzModule()
+    payload = {
+        "artists": [
+            {
+                "id": "artist-1",
+                "name": "周杰伦",
+                "sort-name": "Zhou, Jay",
+                "type": "Person",
+                "life-span": {"begin": "1979-01-18"},
+            }
+        ]
+    }
+    monkeypatch.setattr(module, "_request_json", lambda *_args, **_kwargs: payload)
+    monkeypatch.setattr(module, "_async_request_json", AsyncMock(return_value=payload))
+
+    sync_results = module.search_persons("周杰伦", media_source=MediaSource.MusicBrainz)
+    async_results = asyncio.run(
+        module.async_search_persons("周杰伦", media_source=MediaSource.MusicBrainz)
+    )
+    skipped = module.search_persons("周杰伦", media_source=MediaSource.TMDB)
+
+    assert isinstance(sync_results[0], MusicArtistInfo)
+    assert sync_results[0].music_type == "artist"
+    assert sync_results[0].media_id == "artist-1"
+    assert async_results[0].name == "周杰伦"
+    assert skipped is None
+
+
 def test_search_music_interleaves_recordings_albums_and_artists(monkeypatch):
     """全局音乐搜索应交错返回三类实体，避免单曲结果挤掉整专和艺术家入口。"""
     module = MusicBrainzModule()
@@ -343,6 +374,74 @@ def test_search_music_interleaves_recordings_albums_and_artists(monkeypatch):
     assert results[2].artists == []
     assert requested[1][1]["query"] == 'releasegroup:"晴天" AND artist:("周杰伦" OR "周杰倫")'
     assert requested[2][1]["query"] == 'artist:("周杰伦" OR "周杰倫")'
+
+
+def test_search_music_limits_album_selector_to_release_groups_and_ranks_identity(monkeypatch):
+    """专辑选择器只应请求 Release Group，并把艺人、年份与主类型匹配的录音室专辑排在前面。"""
+    module = MusicBrainzModule()
+    requested = []
+
+    def fake_request(path, params=None):
+        requested.append((path, params))
+        return {
+            "release-groups": [
+                {
+                    "id": "live-single",
+                    "title": "Hotel California",
+                    "primary-type": "Single",
+                    "secondary-types": ["Live"],
+                    "artist-credit": [{"artist": {"id": "eagles", "name": "Eagles"}}],
+                },
+                {
+                    "id": "cover-album",
+                    "title": "Hotel California",
+                    "first-release-date": "2004",
+                    "primary-type": "Album",
+                    "artist-credit": [{"artist": {"id": "cover", "name": "Banda Dos"}}],
+                },
+                {
+                    "id": "studio-album",
+                    "title": "Hotel California",
+                    "first-release-date": "1976-12-08",
+                    "primary-type": "Album",
+                    "artist-credit": [{"artist": {"id": "eagles", "name": "Eagles"}}],
+                },
+            ]
+        }
+
+    monkeypatch.setattr(module, "_request_json", fake_request)
+
+    results = module.search_music(
+        MetaMusic(title="Hotel California", artists=["Eagles"], year=1976),
+        limit=20,
+        music_types=("album",),
+    )
+
+    assert [item.music_type for item in results] == ["album", "album", "album"]
+    assert results[0].media_id == "studio-album"
+    assert [path for path, _params in requested] == ["/release-group"]
+    assert requested[0][1]["limit"] == 100
+
+
+def test_search_music_limits_recording_selector_to_recordings(monkeypatch):
+    """单曲选择器不应额外请求发行组或艺术家。"""
+    module = MusicBrainzModule()
+    requested_paths = []
+
+    def fake_request(path, params=None):
+        requested_paths.append(path)
+        return {"recordings": [{"id": "recording-1", "title": "Hotel California"}]}
+
+    monkeypatch.setattr(module, "_request_json", fake_request)
+
+    results = module.search_music(
+        MetaMusic(title="Hotel California"),
+        limit=20,
+        music_types=("recording",),
+    )
+
+    assert [item.media_id for item in results] == ["recording-1"]
+    assert requested_paths == ["/recording"]
 
 
 def test_file_recognition_searches_recordings_only(monkeypatch):
@@ -1069,6 +1168,28 @@ def test_select_candidate_rejects_wrong_artist_same_title():
     )
 
     assert MusicBrainzModule._select_candidate(meta, [wrong_artist], media_source="musicbrainz") is None
+
+
+def test_select_candidate_rejects_wrong_release_year_and_album():
+    """曲名和艺人相同也不能把有明确专辑证据的原版投影到其他发行版。"""
+    meta = MetaMusic(
+        title="Sparks Fly",
+        artists=["Taylor Swift"],
+        album="Speak Now",
+        year=2010,
+    )
+    wrong_release = MusicInfo(
+        media_source="musicbrainz",
+        media_id="recording-wrong-release",
+        title="Sparks Fly",
+        artists=["Taylor Swift"],
+        album="Now That's What I Call Music",
+        year=2025,
+    )
+
+    assert MusicBrainzModule._select_candidate(
+        meta, [wrong_release], media_source="musicbrainz"
+    ) is None
 
 
 def test_select_candidate_rejects_artist_only_match():

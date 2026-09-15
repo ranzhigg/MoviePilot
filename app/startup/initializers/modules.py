@@ -39,6 +39,7 @@ from app.application.outbox import configure_outbox_dispatcher
 from app.application.plugin.runtime import get_existing_plugin_manager
 from app.application.security.url import close_image_proxy_block_log_coalescer
 from app.application.service import configure_service_directory, reset_service_directory
+from app.application.site.auth import normalize_site_auth_config
 from app.command import CommandChain
 from app.db.session import (
     close_database,
@@ -358,7 +359,7 @@ def configure_config_reload_event_handler_resolver() -> None:
             owner_name=owner_class.__name__,
         )
 
-    EventManager().register_handler_instance_resolver(  # type: ignore[no-untyped-call]
+    EventManager().register_handler_instance_resolver(
         "config_reload",
         resolve,
     )
@@ -460,7 +461,18 @@ def user_auth():
     if sites_helper.auth_level >= 2:
         return
     auth_conf = get_configured_system_config().get(SystemConfigKey.UserSiteAuthParams)
-    status, msg = sites_helper.check_user(**auth_conf) if auth_conf else sites_helper.check_user()
+    if get_runtime_setting("AUTH_SITE"):
+        status, msg = sites_helper.check_user()
+    else:
+        normalized_auth_conf = normalize_site_auth_config(
+            auth_conf,
+            sites_helper.get_authsites(),
+        )
+        status, msg = (
+            sites_helper.check_user(**normalized_auth_conf)
+            if normalized_auth_conf
+            else sites_helper.check_user()
+        )
     if status:
         logger.info(f"{msg} 用户认证成功")
     else:
@@ -665,6 +677,8 @@ async def _initialize_modules() -> HostRuntime:
         system_config=system_config,
         dependencies=runtime_dependencies,
     )
+    if agent_composition.data.invocations is not None:
+        await database_runtime.worker.run(agent_composition.data.invocations.recover_running)
     security_composition = configure_security_services()
     runtime_composition = compose_runtime(
         RuntimeInputs(

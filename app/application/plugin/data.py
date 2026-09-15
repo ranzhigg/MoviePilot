@@ -1,5 +1,7 @@
 """插件持久化数据查询、投影与写用例。"""
 
+from __future__ import annotations
+
 import json
 from collections.abc import Callable
 from typing import Any, Optional, Protocol

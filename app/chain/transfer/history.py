@@ -2,7 +2,7 @@
 
 import re
 from pathlib import Path
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union, cast
 
 from app.chain.media import MediaChain
 from app.chain.transfer.contract import _TransferOwnerBase
@@ -53,6 +53,29 @@ def _recognize_manual_media(
 
 class TransferHistoryOwner(_TransferOwnerBase):
     """唯一持有手动历史、重整命令和通知公开入口。"""
+
+    def _run_manual_transfer_request(
+            self,
+            transfer_kwargs: dict[str, Any],
+            selected_fileitems: Optional[list[FileItem]],
+            report_results: bool = False,
+            skip_success: bool = False,
+    ) -> Tuple[bool, Union[str, dict[str, Any]]]:
+        """批次、回执或成功记录过滤走内部入口，普通请求保持公开签名兼容。"""
+        if selected_fileitems is not None or report_results or skip_success:
+            return cast(
+                Tuple[bool, Union[str, dict[str, Any]]],
+                self._execute_transfer(
+                    **transfer_kwargs,
+                    selected_fileitems=selected_fileitems,
+                    report_results=report_results,
+                    skip_success=skip_success,
+                ),
+            )
+        return cast(
+            Tuple[bool, Union[str, dict[str, Any]]],
+            self.do_transfer(**transfer_kwargs),
+        )
 
     def remote_transfer(
             self,
@@ -171,6 +194,9 @@ class TransferHistoryOwner(_TransferOwnerBase):
             music_type: Optional[str] = None,
             music_release_regions: Optional[list[str]] = None,
             music_release_scripts: Optional[list[str]] = None,
+            selected_fileitems: Optional[list[FileItem]] = None,
+            report_results: bool = False,
+            skip_success: bool = False,
     ) -> Tuple[bool, Union[str, dict[str, Any]]]:
         """
         手动整理，支持复杂条件，带进度显示
@@ -199,11 +225,39 @@ class TransferHistoryOwner(_TransferOwnerBase):
         :param music_type: 音乐实体类型；为保持位置参数兼容，必须追加在签名末尾
         :param music_release_regions: 本次音乐整理的发行地区优先级，空值继承系统设置
         :param music_release_scripts: 本次音乐整理的文字字形优先级，空值继承系统设置
+        :param selected_fileitems: 前端显式选中的批量文件
+        :param report_results: 返回实际阶段回执，后台接收不表示入库完成
+        :param skip_success: 预览和执行均跳过成功记录，优先于强制整理和重整
         """
         logger.info(f"手动整理：{fileitem.path} ...")
         explicit_identity = media_source is not None or media_id is not None
         if explicit_identity and (not media_source or not media_id):
             return False, "手动整理需要同时提供 media_source 和 media_id"
+        transfer_kwargs: dict[str, Any] = dict(
+            fileitem=fileitem,
+            target_storage=target_storage,
+            target_path=target_path,
+            media_source=media_source,
+            mtype=mtype,
+            transfer_type=transfer_type,
+            season=season,
+            epformat=epformat,
+            min_filesize=min_filesize,
+            scrape=scrape,
+            library_type_folder=library_type_folder,
+            library_category_folder=library_category_folder,
+            force=force,
+            background=background,
+            manual=True,
+            downloader=downloader,
+            download_hash=download_hash,
+            preview=preview,
+            reorganize=reorganize,
+            sync_extra_files=sync_extra_files,
+            cleanup_dest_fileitem=cleanup_dest_fileitem,
+            music_release_regions=music_release_regions,
+            music_release_scripts=music_release_scripts,
+        )
         if media_source and media_id:
             # 有输入媒体ID时预先识别，音乐与影视统一走 recognize_media 按类型分发
             mediainfo = _recognize_manual_media(
@@ -225,67 +279,15 @@ class TransferHistoryOwner(_TransferOwnerBase):
             if not isinstance(mediainfo, (MusicInfo, MusicAlbumInfo)):
                 self.obtain_images(mediainfo=mediainfo)
 
-            # 开始整理
-            state, errmsg = self.do_transfer(
-                fileitem=fileitem,
-                target_storage=target_storage,
-                target_path=target_path,
-                mediainfo=mediainfo,
-                mtype=mtype,
-                media_source=media_source,
-                media_id=media_id,
-                transfer_type=transfer_type,
-                season=season,
-                epformat=epformat,
-                min_filesize=min_filesize,
-                scrape=scrape,
-                library_type_folder=library_type_folder,
-                library_category_folder=library_category_folder,
-                force=force,
-                background=background,
-                manual=True,
-                downloader=downloader,
-                download_hash=download_hash,
-                preview=preview,
-                reorganize=reorganize,
-                sync_extra_files=sync_extra_files,
-                cleanup_dest_fileitem=cleanup_dest_fileitem,
-                music_release_regions=music_release_regions,
-                music_release_scripts=music_release_scripts,
-            )
-            if not state:
-                return False, errmsg
+            transfer_kwargs.update(mediainfo=mediainfo, media_id=media_id)
 
-            logger.info(f"{fileitem.path} 整理完成")
-            return True, errmsg if preview else ""
-        else:
-            # 没有输入媒体ID时，按文件识别
-            state, errmsg = self.do_transfer(
-                fileitem=fileitem,
-                target_storage=target_storage,
-                target_path=target_path,
-                media_source=media_source,
-                mtype=mtype,
-                transfer_type=transfer_type,
-                season=season,
-                epformat=epformat,
-                min_filesize=min_filesize,
-                scrape=scrape,
-                library_type_folder=library_type_folder,
-                library_category_folder=library_category_folder,
-                force=force,
-                background=background,
-                manual=True,
-                downloader=downloader,
-                download_hash=download_hash,
-                preview=preview,
-                reorganize=reorganize,
-                sync_extra_files=sync_extra_files,
-                cleanup_dest_fileitem=cleanup_dest_fileitem,
-                music_release_regions=music_release_regions,
-                music_release_scripts=music_release_scripts,
-            )
-            return state, errmsg
+        state, errmsg = self._run_manual_transfer_request(
+            transfer_kwargs, selected_fileitems, report_results, skip_success,
+        )
+        if explicit_identity and state:
+            logger.info(f"{fileitem.path} 整理请求处理完成")
+            return True, errmsg if preview or report_results else ""
+        return state, errmsg
 
     def send_transfer_message(
             self,
@@ -377,8 +379,8 @@ class TransferHistoryOwner(_TransferOwnerBase):
                 if (
                         file_path.suffix in self._allowed_exts
                         and not self._is_blocked_by_exclude_words(
-                    file_path.as_posix(), transfer_exclude_words
-                )
+                            file_path.as_posix(), transfer_exclude_words
+                        )
                         and file_path.exists()
                 ):
                     return False

@@ -54,11 +54,14 @@ def test_match_music_album_selects_release_by_count_and_duration(monkeypatch):
     """曲目数和时长一致的发行版本应被选中并返回曲目表。"""
     module = MusicBrainzModule()
     detail = _release_detail("release-1", "七里香", "周杰伦", ALBUM_TRACKS)
+    detail_request_params = None
 
     def fake_request(path, params=None):
+        nonlocal detail_request_params
         if path == "/release":
             return {"releases": [{"id": "release-1", "title": "七里香"}]}
         if path == "/release/release-1":
+            detail_request_params = params
             return detail
         return None
 
@@ -76,6 +79,10 @@ def test_match_music_album_selects_release_by_count_and_duration(monkeypatch):
     assert [track.media_id for track in album.tracks] == ["rec-1", "rec-2", "rec-3"]
     assert album.tracks[0].track_number == 1
     assert album.tracks[0].album == "七里香"
+    assert detail_request_params is not None
+    assert "release-groups" in detail_request_params["inc"].split("+")
+    assert album.album_type == "Album"
+    assert album.tracks[0].album_type == "Album"
 
 
 def test_match_music_album_rejects_mismatched_trackset(monkeypatch):
@@ -203,6 +210,7 @@ def test_recognize_album_directory_maps_files(tmp_path, media_chain, monkeypatch
         media_id="rg-1",
         title="七里香",
         artists=["周杰伦"],
+        library_category="Album",
         tracks=[
             MusicInfo(
                 media_source="musicbrainz",
@@ -230,9 +238,28 @@ def test_recognize_album_directory_maps_files(tmp_path, media_chain, monkeypatch
         info = matched[str(file.resolve())]
         assert info.media_id == f"rec-{index + 1}"
         assert info.title == ALBUM_TRACKS[index][0]
+        assert info.library_category == "Album"
     # 同一目录再次识别直接命中缓存，不重复请求模块
     assert media_chain.recognize_music_album_directory(album_dir) == matched
     source_chain.match_music_album.assert_called_once()
+
+
+def test_directory_audio_files_only_includes_disc_subdirectories(tmp_path):
+    """专辑根目录只应合并 CD/Disc 子目录，不得把附加版本当成额外碟。"""
+    album_dir = tmp_path / "周杰伦 - 七里香 (2004)"
+    disc_dir = album_dir / "CD2"
+    alternate_dir = album_dir / "附加原版"
+    disc_dir.mkdir(parents=True)
+    alternate_dir.mkdir()
+    root_track = album_dir / "01.flac"
+    disc_track = disc_dir / "01.flac"
+    alternate_track = alternate_dir / "01.flac"
+    for path in (root_track, disc_track, alternate_track):
+        path.write_bytes(b"audio")
+
+    files = MediaChain._directory_audio_files(album_dir)
+
+    assert files == [root_track, disc_track]
 
 
 def test_align_album_tracks_prefers_exact_titles_over_conflicting_positions():

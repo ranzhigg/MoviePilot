@@ -57,7 +57,6 @@ def _request_durable_transfer_retry(
     return result.accepted, result.message
 
 
-
 class FailedRetryMixin(_TransferOwnerBase):
     """提供失败整理的按钮、回调和兼容重试流程。"""
 
@@ -78,6 +77,10 @@ class FailedRetryMixin(_TransferOwnerBase):
         return [
             [
                 {"text": "重试", "callback_data": f"transfer_retry_{history_id}"},
+                {
+                    "text": "重新生成计划",
+                    "callback_data": f"transfer_regenerate_{history_id}",
+                },
                 {
                     "text": "智能助手接管",
                     "callback_data": f"transfer_ai_retry_{history_id}",
@@ -100,6 +103,7 @@ class FailedRetryMixin(_TransferOwnerBase):
         """
         for prefix, action in (
                 ("transfer_retry_", "retry"),
+                ("transfer_regenerate_", "regenerate"),
                 ("transfer_ai_retry_", "ai_retry"),
         ):
             if callback_data.startswith(prefix):
@@ -125,7 +129,7 @@ class FailedRetryMixin(_TransferOwnerBase):
             return False
 
         action, history_id = callback
-        if action == "retry":
+        if action in {"retry", "regenerate"}:
             self._retry_transfer_history(
                 history_id=history_id,
                 channel=channel,
@@ -301,7 +305,7 @@ class FailedRetryMixin(_TransferOwnerBase):
                         username=username,
                         title="智能助手整理完成",
                         text=final_output.strip()
-                             or f"整理记录 #{history_id} 已由智能助手处理完成。",
+                        or f"整理记录 #{history_id} 已由智能助手处理完成。",
                         link=self.runtime_config.history_url,
                         save_history=False,
                     )

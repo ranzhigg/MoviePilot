@@ -338,6 +338,15 @@ async def update_subscribe(
         subscribe_dict["type"] = subscribe.type
         subscribe_dict["music_type"] = subscribe.music_type
         subscribe_dict["total_tracks"] = subscribe.total_tracks if subscribe.music_type == MUSIC_ENTITY_ALBUM else None
+        if identity_fields and subscribe.music_type == MUSIC_ENTITY_ALBUM:
+            old_identity = resolve_media_identity(media=subscribe)
+            new_identity = resolve_media_identity(
+                media_source=subscribe_dict.get("media_source"),
+                media_id=subscribe_dict.get("media_id"),
+            )
+            if old_identity != new_identity:
+                # 媒体身份变化后，旧专辑的音轨事实不能迁移到新专辑。
+                subscribe_dict["downloaded_tracks"] = []
     total_episode_updated = "total_episode" in subscribe_in.model_fields_set
     if (
         total_episode_updated
@@ -399,17 +408,37 @@ async def subscribe_media_identity(
     media_source: MediaSource,
     season: Optional[int] = None,
     title: Optional[str] = None,
+    year: Optional[str] = None,
+    mtype: Optional[MediaType] = None,
     music_type: Optional[str] = None,
     query: SubscriptionQueryService = Depends(get_subscription_query_service),
     current_user: ApiPrincipal = Depends(get_current_active_user_async),
 ) -> Any:
     """
-    根据媒体来源和原生 ID 查询订阅。
+    根据媒体身份查询订阅，视频身份未命中时按类型、标题和年份回退。
     """
+    metadata = MetaInfo(title) if title else None
+    normalized_title = metadata.name if metadata else None
+    if season is None and metadata:
+        season = metadata.begin_season
     subscribes = await query.list_by_media_identity(media_source, media_id, music_type)
     if season is not None:
         subscribes = [subscribe for subscribe in subscribes if subscribe.season == season]
     result = select_accessible_subscribe(subscribes, current_user)
+    if (
+        not result
+        and media_source != MediaSource.TMDB
+        and mtype in (MediaType.MOVIE, MediaType.TV)
+        and normalized_title
+        and year
+    ):
+        subscribes = await query.list_by_video_metadata(
+            title=normalized_title,
+            year=year,
+            media_type=mtype,
+            season=season,
+        )
+        result = select_accessible_subscribe(subscribes, current_user)
     return result if result else _SchemaSubscribe()
 
 

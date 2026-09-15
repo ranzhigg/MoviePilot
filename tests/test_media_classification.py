@@ -9,6 +9,9 @@ from typing import Any, Callable
 
 import pytest
 
+from app.application.classification.configuration import (
+    build_default_classification_policy,
+)
 from app.domain.classification.evaluator import ClassificationEvaluator
 from app.domain.classification.fields import get_standard_classification_fields
 from app.domain.classification.validation import ClassificationPolicyValidator
@@ -183,6 +186,40 @@ def _leaf(field: str, operator: str, value: Any = _MISSING) -> dict[str, Any]:
     if value is not _MISSING:
         condition["value"] = value
     return condition
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("album_type", "secondary_types", "category_id", "category_path"),
+    [
+        ("Album", ["Compilation"], "music.compilation", ["Album", "Compilation"]),
+        ("EP", [], "music.ep", ["EP"]),
+        ("Single", [], "music.single", ["Single"]),
+        ("Album", [], "music.album", ["Album"]),
+    ],
+)
+def test_default_music_policy_uses_structured_album_categories(
+    album_type: str,
+    secondary_types: list[str],
+    category_id: str,
+    category_path: list[str],
+) -> None:
+    """默认音乐规则应优先识别精选集，并生成不带空白的安全路径段。"""
+    policy = build_default_classification_policy().model_copy(update={"revision": 1})
+    result = _evaluate(
+        policy,
+        _facts(
+            media_type="音乐",
+            media_source="musicbrainz",
+            values={
+                "music.album_type": album_type,
+                "music.secondary_types": secondary_types,
+            },
+        ),
+    )
+
+    assert result.result.effective is not None
+    assert result.result.effective.category_id == category_id
+    assert result.result.effective.category_path == category_path
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
@@ -375,6 +412,23 @@ def test_rule_source_and_media_type_restrictions_are_applied_before_conditions(
     )
 
     assert evaluation.result.recommended.category_id == expected_category
+
+
+def test_unavailable_source_field_is_rejected() -> None:
+    """限定到完全不支持字段的来源时，策略不得发布。"""
+    result = _validation_report(
+        _policy(
+            _category_rule(
+                "rule.unavailable",
+                _leaf("media.runtime", "gte", 90),
+                media_types=["电影"],
+                sources=["tvdb"],
+            )
+        ).model_dump(mode="json")
+    )
+
+    assert result.valid is False
+    assert any(issue.code == "unavailable_field_support" for issue in result.issues)
 
 
 def test_trace_reports_actual_values_and_match_decisions() -> None:

@@ -22,6 +22,7 @@ _VERSIONS = {
     "instrumental": r"\binstrumental\b|\bkaraoke\b|伴奏|纯音乐|純音樂",
     "acoustic": r"\bacoustic\b|\bunplugged\b|不插电|不插電",
     "demo": r"\bdemo\b",
+    "rerecorded": r"\btaylor(?:'|’)?s version\b|\bre-?record(?:ed|ing)\b|重录|重錄",
 }
 _VERSION_SUFFIX = re.compile(
     r"\s*[\[(（【][^\])）】]*(?:\blive\b|\bremix\b|\binstrumental\b|\bacoustic\b|"
@@ -33,6 +34,24 @@ _BARE_VERSION_SUFFIX = re.compile(
     r"现场|現場|混音|伴奏|不插电|不插電).*$", re.IGNORECASE,
 )
 _TITLE_LABEL = re.compile(r"^(?:专辑(?:名|名称)?|專輯(?:名|名稱)?|曲名|歌曲|album|title)\s*[:：]\s*", re.I)
+_TITLE_CREDIT = re.compile(
+    r"\s*[（(]\s*(?:feat(?:uring)?\.?\s+[^()（）]+|"
+    r"(?:电视剧|電視劇|电影|電影|影视剧|影視劇|动画|動畫)?\s*《[^《》]+》"
+    r"\s*(?:电视剧|電視劇|电影|電影|影视剧|影視劇|动画|動畫)?"
+    r"\s*(?:[“「][^”」]+[”」])?\s*(?:主题曲|主題曲|片头曲|片頭曲|片尾曲|插曲))\s*[）)]",
+    re.IGNORECASE,
+)
+_SOUNDTRACK_CREDIT = re.compile(
+    r"\s*[\[(（【]\s*from\s+(?:the\s+)?(?:original\s+)?"
+    r"(?:motion\s+picture|film|movie)\b[^\])）】]*[\])）】]",
+    re.IGNORECASE,
+)
+_CJK_SOUNDTRACK_SUFFIX = re.compile(
+    r"\s*《[^《》]+》\s*(?:电视剧|電視劇|电影|電影|影视剧|影視劇|动画|動畫)?\s*"
+    r"(?:原声|原聲)?\s*(?:主题曲|主題曲|片头曲|片頭曲|片尾曲|插曲)\s*$",
+    re.IGNORECASE,
+)
+_FEATURED_CREDIT = re.compile(r"[（(]\s*feat(?:uring)?\.?\s+([^()（）]+)[）)]", re.IGNORECASE)
 _COLLECTIVE_ARTISTS = ("Various Artists", "Various", "VA", "群星", "众艺人", "眾藝人")
 _VERSION_YEAR = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)")
 _VERSION_DATE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?:[-./]|年)\s*(\d{1,2})(?:[-./]|月)\s*(\d{1,2})日?(?!\d)")
@@ -101,8 +120,10 @@ def music_artist_matches(music: MusicInfo, parsed_artists: Iterable[str]) -> boo
 
 
 def music_base_title(value: Optional[str], *, preserve_editions: bool = False) -> str:
-    """剥离已知版本后缀；数据源可保留发行版标签，不改变未知括号中的作品名。"""
-    text = str(value or "")
+    """剥离明确署名、影视用途和版本注释，保留未知括号中的作品名。"""
+    text = _CJK_SOUNDTRACK_SUFFIX.sub(
+        "", _SOUNDTRACK_CREDIT.sub("", _TITLE_CREDIT.sub("", str(value or "")))
+    )
     if not preserve_editions:
         text = _EDITION.sub("", text)
 
@@ -120,6 +141,31 @@ def music_title_matches(music: MusicInfo, title: Optional[str], *, preserve_edit
         expected == music_text_key(music_base_title(normalize("NFKC", name), preserve_editions=preserve_editions))
         for name in music_titles(music)
     ))
+
+
+def music_album_matches(music: MusicInfo, album: Optional[str]) -> bool:
+    """核验所属专辑本体，忽略 Deluxe 等发行装帧说明但保留录音版本边界。"""
+    def album_key(value: Optional[str]) -> str:
+        """目录常在发行说明后附加 CD1/Disc 2，不应改变专辑身份。"""
+        base = music_base_title(normalize("NFKC", str(value or "")))
+        base = re.sub(r"[\s._-]*(?:cd|disc|disk)\s*\d+$", "", base, flags=re.I)
+        return music_text_key(base)
+
+    expected = album_key(album)
+    return bool(expected and any(
+        expected == album_key(name)
+        for name in music_titles(music, album=True)
+    ))
+
+
+def music_year_matches(music: MusicInfo, meta: MetaMusic) -> bool:
+    """双方都有发行年份时要求一致；任一侧未知时不凭空制造冲突。"""
+    if not music.year or not meta.year:
+        return True
+    try:
+        return int(music.year) == int(meta.year)
+    except (TypeError, ValueError):
+        return str(music.year).strip() == str(meta.year).strip()
 
 
 def _isrc_key(value: Optional[str]) -> Optional[str]:
@@ -219,8 +265,26 @@ def _version_dates(title: Optional[str], version: Optional[str]) -> tuple[set[in
     return years, dates
 
 
+def _resource_credits_match(music: MusicInfo, meta: MetaMusic) -> bool:
+    """资源显式客串署名必须得到目标艺术家或同一署名注释确认，不能把合作版匹配为独唱。"""
+    credits = {
+        music_text_key(artist)
+        for value in _FEATURED_CREDIT.findall(meta.title or "")
+        for artist in MetaMusic._split_artists(value)
+    }
+    confirmed = {music_text_key(artist) for artist in music_artists(music)}
+    confirmed.update(
+        music_text_key(artist)
+        for value in _FEATURED_CREDIT.findall(music.title or "")
+        for artist in MetaMusic._split_artists(value)
+    )
+    return credits <= confirmed
+
+
 def music_version_matches(music: MusicInfo, meta: MetaMusic) -> bool:
     """资源匹配与候选确认共用录音版本约束，不从艺术家字段推断版本。"""
+    if not _resource_credits_match(music, meta):
+        return False
     target_title = music.album or music.title if music.music_type == MUSIC_ENTITY_ALBUM else music.title
     # 专辑类型描述整专版本，但单曲的所属专辑类型不能代替该录音自身的版本。
     album_versions = " ".join(music.secondary_types or []) if music.music_type == MUSIC_ENTITY_ALBUM else ""

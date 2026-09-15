@@ -142,6 +142,15 @@ class TransferHistory(OptionalMediaIdentityMixin, BaseModel):
     status: bool = True
     # 失败原因
     errmsg: Optional[str] = None
+    # 从失败原因和失败计数派生的用户可操作状态。
+    failure_stage: Optional[str] = None
+    recovery_action: Optional[str] = None
+    retry_count: Optional[int] = None
+    retry_exhausted: bool = False
+    auto_paused: bool = False
+    # 下载器清理独立于媒体入库结果。
+    cleanup_status: Optional[str] = None
+    cleanup_error: Optional[str] = None
     # 日期
     date: Optional[str] = None
     # 文件清单
@@ -165,6 +174,12 @@ class BatchTransferHistoryRedoRequest(BaseModel):
     """批量重新整理历史请求。"""
 
     history_ids: list[int] = Field(default_factory=list)
+
+
+class TransferHistoryDiscardResult(BaseModel):  # type: ignore[misc]
+    """损坏整理任务清理结果，标识保留供后续操作的历史记录。"""
+
+    history_id: int = Field(description="保留的整理历史记录 ID")
 
 
 class TransferHistoryPage(BaseModel):

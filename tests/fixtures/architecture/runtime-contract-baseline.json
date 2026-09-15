@@ -152,14 +152,14 @@
         "introduced": "v3.0.0",
         "is_package": false,
         "owner": "runtime",
-        "replacement": "app.sdk.plugins",
+        "replacement": "app.sdk.plugin.manager",
         "target": "app.runtime.extensions.module.manager"
       },
       "app.core.plugin": {
         "introduced": "v3.0.0",
         "is_package": false,
         "owner": "runtime",
-        "replacement": "app.sdk.plugins",
+        "replacement": "app.sdk.plugin.manager",
         "target": "app.runtime.extensions.plugin.manager"
       },
       "app.core.security": {
@@ -616,6 +616,13 @@
         "owner": "runtime",
         "replacement": "app.runtime.resources",
         "target": "app.runtime.resources"
+      },
+      "app.sdk.plugins": {
+        "introduced": "v3.0.0",
+        "is_package": false,
+        "owner": "sdk",
+        "replacement": "app.sdk.plugin.manager",
+        "target": "app.sdk.plugin.manager"
       },
       "app.utils.coalesce": {
         "introduced": "v3.0.0",
@@ -1084,6 +1091,18 @@
           "replacement": "app.schemas.media.resolve_media_identity",
           "target_module": "app.schemas.media",
           "target_name": "resolve_media_identity"
+        }
+      },
+      "app.plugins": {
+        "PluginChian": {
+          "replacement": "app.sdk.plugin.PluginChain",
+          "target_module": "app.sdk.plugin.base",
+          "target_name": "PluginChain"
+        },
+        "_PluginBase": {
+          "replacement": "app.sdk.plugin._PluginBase",
+          "target_module": "app.sdk.plugin.base",
+          "target_name": "_PluginBase"
         }
       },
       "app.schemas": {
@@ -1763,7 +1782,7 @@
           "c53927bd5752ec004ac403f6dc07fca7b253f0db152fc773643972d7c3bf5d34"
         ],
         "producer_fingerprints": [
-          "36d3234c5f3cd7317c34d6ee71bc065946ea0e981dd2377589f73e54ebaf8703"
+          "10cb1814f97ef9511346d9b79e13255d603f1d7f63fdc3126138d07d74eb8881"
         ]
       },
       "EventType.DownloadAdded": {
@@ -2955,9 +2974,9 @@
         "events": [
           "EventType.ConfigChanged"
         ],
-        "fingerprint": "36d3234c5f3cd7317c34d6ee71bc065946ea0e981dd2377589f73e54ebaf8703",
+        "fingerprint": "10cb1814f97ef9511346d9b79e13255d603f1d7f63fdc3126138d07d74eb8881",
         "invalid": false,
-        "method": "async_send_event",
+        "method": "async_send_event_strict",
         "qualname": "_ConfigurationEventAdapter.publish",
         "receiver_kind": "canonical_singleton"
       },
@@ -4671,7 +4690,7 @@
         "media_source",
         "name"
       ],
-      "result_contract": "list[MediaPerson]",
+      "result_contract": "list[MediaPerson | MusicArtistInfo]",
       "result_shape": "list",
       "supports_async": true,
       "supports_sync": true,
@@ -7123,7 +7142,7 @@
         "media_source",
         "name"
       ],
-      "result_contract": "list[MediaPerson]",
+      "result_contract": "list[MediaPerson | MusicArtistInfo]",
       "result_shape": "list",
       "supports_async": true,
       "supports_sync": true,
@@ -10002,6 +10021,16 @@
       },
       {
         "kind": "import",
+        "name": "MusicInfo",
+        "target": "app.domain.context.MusicInfo"
+      },
+      {
+        "kind": "import",
+        "name": "MusicLyrics",
+        "target": "app.domain.context.MusicLyrics"
+      },
+      {
+        "kind": "import",
         "name": "MusicNameContext",
         "target": "app.domain.meta.metamusic.MusicNameContext"
       },
@@ -10156,18 +10185,6 @@
         "kind": "import",
         "name": "WebUtils",
         "target": "app.adapters.external.location.WebUtils"
-      }
-    ],
-    "app.sdk.plugins": [
-      {
-        "kind": "import",
-        "name": "ModuleManager",
-        "target": "app.runtime.extensions.module.manager.ModuleManager"
-      },
-      {
-        "kind": "import",
-        "name": "PluginManager",
-        "target": "app.runtime.extensions.plugin.manager.PluginManager"
       }
     ],
     "app.sdk.queries": [

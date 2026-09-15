@@ -219,6 +219,18 @@ def test_theaudiodb_module_ignores_other_sources(monkeypatch):
     request.assert_not_called()
 
 
+@pytest.mark.parametrize("module_class", [DoubanModule, TheAudioDbModule])
+def test_music_search_modules_accept_entity_filter_from_shared_dispatch(module_class):
+    """共享模块调度器广播实体过滤参数时，各内置音乐来源都必须保持签名兼容。"""
+    module = module_class()
+
+    assert module.search_music(
+        MetaMusic(title="Yellow"),
+        media_source=MediaSource.MusicBrainz,
+        music_types=("recording", "album"),
+    ) is None
+
+
 def test_theaudiodb_title_only_search_skips_incomplete_track_and_album_requests(monkeypatch):
     """缺少艺术家时只搜索艺术家，避免请求会返回空正文的曲目和专辑接口。"""
     module = TheAudioDbModule()
@@ -543,7 +555,7 @@ async def test_douban_compilation_lookup_preserves_performer_evidence(async_mode
     meta = MetaMusic(title="Song", artists=["Performer"], album="Sampler", album_artist="Various Artists")
     if async_mode:
         result = await module.async_recognize_media(meta=meta, media_source=MediaSource.DoubanMusic,
-                                                     music_type="recording")
+                                                    music_type="recording")
     else:
         result = module.recognize_media(meta=meta, media_source=MediaSource.DoubanMusic, music_type="recording")
     assert result and result.media_id == "1:1"

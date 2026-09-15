@@ -280,6 +280,26 @@ _MUSIC_PAREN_SPEC_RE = re.compile(
 _MUSIC_EMPTY_BRACKET_RE = re.compile(r"[\(（\[]\s*(?:[/+,\-]\s*)*[\)）\]]")
 # 尾部花括号通常是唱片目录号或发布标记，仅在末尾剔除，保护正文中的花括号文本。
 _MUSIC_TRAILING_CATALOG_RE = re.compile(r"\s*\{[A-Za-z0-9][^{}]{0,40}\}\s*$")
+# 标准抓轨发布尾链有介质、音频格式和厂牌目录三重证据；不删除正文中的 CD 或花括号。
+_MUSIC_RESOURCE_CATALOG_TAIL_RE = re.compile(
+    rf"(?<=[)）])\s+-\s+(?:CD|SACD|WEB)\s+-\s+\[[^\]\r\n]*"
+    rf"(?:{_MUSIC_FORMAT_TOKEN_ALT})[^\]\r\n]*\]"
+    r"(?:\s+-\s+\d+(?:\.\d+)?\s*(?:bits?|kHz|Hz))*"
+    r"\s+-\s+\{[^{}\r\n]+\}(?:\s+-\s+[A-Za-z0-9][A-Za-z0-9@._-]*)?\s*$",
+    re.IGNORECASE,
+)
+# 发行年份与独立规格尾段共同限定资源命名，不能仅凭无空格连字符猜测署名方向。
+_MUSIC_RESOURCE_RELEASE_RE = re.compile(
+    r"^(?P<name>.+?)\s+(?P<year>(?:19|20)\d{2})\s+[-–—−－]+\s+(?P<spec>.+)$"
+)
+_MUSIC_RESOURCE_BRACKET_RE = re.compile(
+    r"^\s*\[(?P<name>[^\[\]]+)\]\s*\[(?P<year>(?:19|20)\d{2})\](?P<tail>.*)$"
+)
+_MUSIC_RESOURCE_GROUP_RE = re.compile(
+    r"^(?P<spec>.+?)(?:\s*[-–—−－]+\s*|\s+)"
+    r"(?!(?:DELUXE|EXPANDED|SPECIAL|LIMITED|ANNIVERSARY|REMASTER(?:ED)?|RE-?RECORD(?:ED|ING))$)"
+    r"(?P<group>[A-Z0-9][A-Z0-9@._-]{1,20})$"
+)
 # 年份及完整发行日期括号提供候选消歧线索，规格或目录号不作为日期。
 _MUSIC_YEAR_RE = re.compile(
     r"[\(\[（【]((?:19|20)\d{2})"
@@ -368,6 +388,9 @@ _MUSIC_DISC_DIR_RE = re.compile(
 )
 # 目录名中的年份：(2004)、[2004]
 _MUSIC_DIR_YEAR_RE = re.compile(r"[(\[]\s*(?P<year>(?:19|20)\d{2})\s*[)\]]")
+_MUSIC_DIR_PREFIX_YEAR_RE = re.compile(
+    r"^(?P<year>(?:19|20)\d{2})\s*[-._\s]+(?!(?:19|20)\d{2}\b)"
+)
 # 目录名中的括号补充说明（格式、音质、厂牌等），如 [FLAC 24bit-96kHz]
 _MUSIC_BRACKET_RE = re.compile(r"\[[^\]]*\]|【[^】]*】|\([^)]*\)")
 _MUSIC_RECORDING_VERSION_RE = re.compile(
@@ -739,10 +762,14 @@ class MetaMusic(MetaBase):
     def parse_resource(cls, title: str, subtitle: Optional[str] = None) -> "MetaMusic":
         """合并资源标题与副标题的独立证据，不使用搜索目标补写作品身份。
 
-        标题解析仍复用 Python/Rust 公共入口；副标题只补缺失字段，保留标题中
-        已有的署名。专辑、曲序、曲名的明确多段格式在资源层统一补充。
+        带年份及规格证据的发行命名先统一归一，再复用 Python/Rust 公共入口；
+        副标题只补缺失字段，保留标题中已有的署名。专辑、曲序、曲名的明确
+        多段格式在资源层统一补充。
         """
-        meta = cls.parse_query(title)
+        meta = cls.parse_query(cls._normalize_resource_release(title))
+        meta.org_string = title
+        meta.apply_audio_quality(title)
+        subtitle = (subtitle or "").replace("丨", "|")
         if not meta.title:
             # 整个作品名位于中文展示括号内时，旧解析器可能把它误当发布标签删除。
             bracket = re.match(r"^\s*[【《「]([^】》」]+)[】》」]", title)
@@ -797,6 +824,42 @@ class MetaMusic(MetaBase):
         if not meta.version:
             meta.version = cls._resource_version(title, subtitle)
         return meta
+
+    @classmethod
+    def _normalize_resource_release(cls, title: str) -> str:
+        """在 Python/Rust 解析前归一带年份及规格证据的站点发行命名。
+
+        方括号只展开首个作品段；独立规格尾段允许携带发布组。此类发行命名的
+        中文紧凑署名采用「艺人-作品」，普通「作品-艺人」查询仍保留原有规则。
+        """
+        text = _MUSIC_RESOURCE_CATALOG_TAIL_RE.sub("", title)
+        bracket = _MUSIC_RESOURCE_BRACKET_RE.fullmatch(text)
+        if bracket:
+            name, year = bracket.group("name", "year")
+            tail = bracket.group("tail")
+        else:
+            release = _MUSIC_RESOURCE_RELEASE_RE.fullmatch(text)
+            if not release or not cls._is_resource_spec_tail(release.group("spec")):
+                return text
+            name, year = release.group("name", "year")
+            tail = ""
+        if not _MUSIC_ARTIST_TITLE_RE.match(name):
+            artist, separator, work = name.partition("-")
+            if separator and cls._contains_cjk(artist) and cls._contains_cjk(work):
+                name = f"{artist.strip()} - {work.strip()}"
+        # 保留尾部裸年份，让 Album/Single 等真实作品名不会提前被当作独立发行标签删除。
+        return f"{name} {year}{tail}"
+
+    @staticmethod
+    def _is_resource_spec_tail(value: str) -> bool:
+        """只清理完整规格及大写发布组尾标，录音版本和发行版本词必须保留。"""
+        if _MUSIC_SPEC_SEGMENT_RE.fullmatch(value):
+            return True
+        group = _MUSIC_RESOURCE_GROUP_RE.fullmatch(value)
+        return bool(
+            group and _MUSIC_SPEC_SEGMENT_RE.fullmatch(group.group("spec"))
+            and not _MUSIC_RECORDING_VERSION_RE.search(f"({group.group('group')})")
+        )
 
     @classmethod
     def _native_resource_title(
@@ -1603,16 +1666,27 @@ class MetaMusic(MetaBase):
         if not text:
             return {}
         year = None
+        prefixed_year = False
         year_match = _MUSIC_DIR_YEAR_RE.search(text)
         if year_match:
             year = int(year_match.group("year"))
             text = _MUSIC_DIR_YEAR_RE.sub(" ", text)
+        else:
+            prefix_year_match = _MUSIC_DIR_PREFIX_YEAR_RE.match(text)
+            if prefix_year_match:
+                year = int(prefix_year_match.group("year"))
+                text = text[prefix_year_match.end():]
+                prefixed_year = True
         # 括号内的格式/音质描述先剥离出专辑名，但仍可用于音质解析
         brackets = " ".join(fragment for fragment in _MUSIC_BRACKET_RE.findall(text))
         album_text = cls._clean_text(_MUSIC_BRACKET_RE.sub(" ", text))
         if not album_text:
             return {}
-        artist, album = cls.split_artist_title(album_text)
+        artist, album = (
+            (None, album_text)
+            if prefixed_year
+            else cls.split_artist_title(album_text)
+        )
         return {
             "artist": artist,
             "album": album,

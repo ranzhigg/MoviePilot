@@ -21,12 +21,13 @@ from app.agent.policy.contracts import (
     ToolPolicyContext,
 )
 from app.agent.policy.orchestrator import DEFAULT_TOOL_POLICY_ORCHESTRATOR
+from app.agent.terminal.manager import _TerminalSessionManager
+from app.agent.terminal.ownership import current_terminal_scope
+from app.agent.terminal.session import _TerminalSession
 from app.agent.tools.base import MoviePilotTool
 from app.agent.tools.catalog import ToolCatalogSnapshot
-from app.agent.tools.impl._terminal_session import (
-    _TerminalSession,
-    _TerminalSessionManager,
-)
+
+pytestmark = pytest.mark.usefixtures("terminal_scope")
 
 
 class _SlowWriteTool(MoviePilotTool):
@@ -105,7 +106,7 @@ async def test_terminal_manager_close_terminates_running_pipe_session() -> None:
         command=_shell_command("import time; time.sleep(30)"),
         use_pty=False,
     )
-    session = manager.get_session(payload["session_id"])
+    session = manager._sessions[payload["session_id"]]
 
     await manager.close()
 
@@ -122,6 +123,7 @@ async def test_terminal_manager_close_waits_for_starting_session() -> None:
     start_entered = asyncio.Event()
     allow_start = asyncio.Event()
     session = _TerminalSession(
+        owner=current_terminal_scope(),
         session_id="term-starting",
         command="sleep",
         cwd=".",
@@ -129,13 +131,14 @@ async def test_terminal_manager_close_waits_for_starting_session() -> None:
         use_pty=False,
     )
 
-    async def _start_session(*_args) -> _TerminalSession:
+    async def _start_session(*_args, **_kwargs) -> _TerminalSession:
+        """启动握手保留会话，允许传入已解析解释器而不改变关闭竞态。"""
         start_entered.set()
         await allow_start.wait()
         return session
 
     manager._start_pipe_session = _start_session
-    manager._terminate_session = AsyncMock()
+    manager._terminate_session = AsyncMock(return_value=True)
 
     start_task = asyncio.create_task(manager.start(command="sleep", use_pty=False))
     await start_entered.wait()
@@ -173,6 +176,7 @@ async def test_terminal_manager_cancellation_terminates_unregistered_session() -
     release_registration = asyncio.Event()
     termination_started = asyncio.Event()
     session = _TerminalSession(
+        owner=current_terminal_scope(),
         session_id="term-cancelled",
         command="sleep",
         cwd=".",
@@ -181,18 +185,22 @@ async def test_terminal_manager_cancellation_terminates_unregistered_session() -
     )
 
     async def _hold_registration_lock() -> None:
+        """精确阻塞会话登记，供取消路径验证尚未交付的进程归属。"""
         await session_created.wait()
         async with manager._lock:
             registration_locked.set()
             await release_registration.wait()
 
-    async def _start_session(*_args) -> _TerminalSession:
+    async def _start_session(*_args, **_kwargs) -> _TerminalSession:
+        """返回已创建但尚未登记的会话，解释器注入不影响该时序。"""
         session_created.set()
         await registration_locked.wait()
         return session
 
-    async def _terminate_session(_session: _TerminalSession) -> None:
+    async def _terminate_session(_session: _TerminalSession) -> bool:
+        """标记取消收尾已开始，避免用固定等待猜测执行顺序。"""
         termination_started.set()
+        return True
 
     lock_holder = asyncio.create_task(_hold_registration_lock())
     manager._start_pipe_session = _start_session

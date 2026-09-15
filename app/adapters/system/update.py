@@ -18,7 +18,7 @@ from typing import Any, cast
 
 from app.adapters.network.http import RequestUtils
 from app.adapters.system.resource import ResourceHelper, get_resource_versions
-from app.foundation.environment import is_docker
+from app.foundation.environment import is_docker, is_exe
 from app.foundation.singleton import SingletonClass
 from app.foundation.version import compare_version
 from app.runtime.dependencies.profile import runtime_sync_arguments
@@ -559,7 +559,8 @@ class SystemUpdateManager(metaclass=SingletonClass):
             try:
                 prepared = self._read_prepared_manifest()
                 if target == _APPLICATION:
-                    self._validate_application_manifest(prepared)
+                    if not is_exe():
+                        self._validate_application_manifest(prepared)
                     message = "主程序更新包已就绪，正在重启安装"
                 else:
                     self._validate_resource_manifest(prepared)
@@ -877,6 +878,28 @@ class SystemUpdateManager(metaclass=SingletonClass):
                 resource_dir = legacy_dir
         return resource_dir
 
+    @staticmethod
+    def _is_site_runtime_resource(path: Path) -> bool:
+        """判断文件是否属于需要跨 Docker 应用升级继承的站点运行时资源。"""
+        return path.is_file() and (
+            (path.name.startswith("user.sites.") and path.suffix == ".bin")
+            or (
+                path.name.startswith("sites.")
+                and path.suffix in {".so", ".pyd", ".dylib"}
+            )
+        )
+
+    def _copy_site_runtime_resources(
+        self, source_dir: Path, destination_dir: Path
+    ) -> None:
+        """只把旧版本的站点索引和原生资源叠加到新版源码目录。"""
+        if not source_dir.is_dir():
+            return
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        for path in source_dir.iterdir():
+            if self._is_site_runtime_resource(path):
+                shutil.copy2(path, destination_dir / path.name)
+
     def _copy_prepared_resources(
         self, prepared: dict[str, Any], resource_dir: Path
     ) -> None:
@@ -895,7 +918,12 @@ class SystemUpdateManager(metaclass=SingletonClass):
         *,
         include_resources: bool,
     ) -> tuple[Path, Path]:
-        """解压并组装待切换的 Docker 后端、前端和插件资源载荷。"""
+        """
+        解压并组装待切换的 Docker 后端、前端和插件资源载荷。
+
+        新版本归档是 Python 源码的唯一来源，旧版本目录只叠加插件和站点运行时资源，
+        避免把新版新增的应用模块覆盖掉。
+        """
         backend_extract = temporary_root / "backend"
         frontend_extract = temporary_root / "frontend"
         backend_extract.mkdir()
@@ -925,13 +953,8 @@ class SystemUpdateManager(metaclass=SingletonClass):
             raise RuntimeError("插件运行目录缺少 app.plugins 兼容入口")
 
         stage_resources = stage_app / "app" / "application" / "site"
-        if stage_resources.exists() or stage_resources.is_symlink():
-            self._remove_path(stage_resources)
         current_resources = self._resource_source_dir(current_app)
-        if current_resources.is_dir():
-            shutil.copytree(current_resources, stage_resources, symlinks=True)
-        else:
-            stage_resources.mkdir(parents=True, exist_ok=True)
+        self._copy_site_runtime_resources(current_resources, stage_resources)
         if include_resources:
             self._copy_prepared_resources(prepared, stage_resources)
         return stage_app, stage_public
@@ -1020,7 +1043,7 @@ class SystemUpdateManager(metaclass=SingletonClass):
             logger.warning(f"Docker 更新已完成但旧载荷清理失败：{error}")
 
     def _apply_docker_resources(self, prepared: dict[str, Any]) -> None:
-        """原子替换 Docker 当前源码携带的站点资源目录。"""
+        """备份并替换 Docker 站点资源，失败时恢复旧目录。"""
         resource_dir = self._resource_source_dir(self._docker_app_dir)
         resource_dir.parent.mkdir(parents=True, exist_ok=True)
         with TemporaryDirectory(
@@ -1035,11 +1058,14 @@ class SystemUpdateManager(metaclass=SingletonClass):
             backup_dir = resource_dir.with_name(f"{resource_dir.name}.__prepared_previous__")
             self._remove_path(backup_dir)
             if resource_dir.exists() or resource_dir.is_symlink():
-                resource_dir.replace(backup_dir)
+                # OverlayFS 下镜像层目录不能直接重命名，先复制完整备份再移除。
+                shutil.copytree(resource_dir, backup_dir, symlinks=True)
             try:
+                self._remove_path(resource_dir)
                 stage_dir.replace(resource_dir)
             except OSError:
                 if backup_dir.exists():
+                    self._remove_path(resource_dir)
                     backup_dir.replace(resource_dir)
                 raise
             self._remove_path(backup_dir)
@@ -1072,7 +1098,10 @@ class SystemUpdateManager(metaclass=SingletonClass):
         """在后台线程中下载并校验指定升级类型的制品。"""
         try:
             if target == _APPLICATION:
-                self._download_application()
+                if is_exe():
+                    self._simulate_application_download()
+                else:
+                    self._download_application()
             else:
                 self._download_resources()
         except Exception as error:  # noqa: BLE001  后台线程必须沉淀为可查询失败
@@ -1082,6 +1111,35 @@ class SystemUpdateManager(metaclass=SingletonClass):
             with self._lock:
                 self._download_active = False
                 self._active_target = None
+
+    def _simulate_application_download(self) -> None:
+        """exe 部署下模拟主程序下载，直接写入准备清单并反馈完成。"""
+        if get_runtime_setting("MOVIEPILOT_AUTO_UPDATE") is not True:
+            raise RuntimeError("请先在高级设置里启用自动检查版本更新")
+        target_item = self._get_item(self._read_state(), _APPLICATION)
+        version = str(target_item.get("version") or "")
+        if not version:
+            raise RuntimeError("主程序更新缺少目标版本")
+        self._merge_prepared_manifest(
+            {
+                "version": version,
+                "frontend_version": version,
+                "backend_archive": str(self._backend_archive),
+                "frontend_archive": str(self._frontend_archive),
+                "backend_sha256": "",
+                "frontend_sha256": "",
+                "prepared_at": self._now(),
+            },
+        )
+        self._write_item(
+            _APPLICATION,
+            state="ready",
+            downloaded_bytes=100,
+            total_bytes=100,
+            error=None,
+            can_update=False,
+            can_install=True,
+        )
 
     def _download_application(self) -> None:
         """下载后端 Release 和其 version.py 声明的前端 dist.zip。"""
@@ -1312,20 +1370,27 @@ class SystemUpdateManager(metaclass=SingletonClass):
                 raise RuntimeError(f"站点资源文件校验失败：{item.get('name')}")
 
     def _request(self) -> RequestUtils:
-        """创建访问 GitHub Release 的请求客户端。"""
+        """创建访问 GitHub Release API 的认证请求客户端。"""
         return RequestUtils(
             proxies=get_runtime_setting("PROXY"),
             headers=get_runtime_setting("GITHUB_HEADERS"),
             timeout=60,
         )
 
+    def _download_request(self) -> RequestUtils:
+        """创建公开 GitHub 归档下载客户端，避免认证头传递到 codeload。"""
+        return RequestUtils(
+            proxies=get_runtime_setting("PROXY"),
+            timeout=60,
+        )
+
     def _download_file(
         self, url: str, destination: Path, downloaded_before: int, total_hint: int
     ) -> tuple[int, int]:
-        """流式下载文件并把进度写入当前升级类型。"""
+        """使用公开下载客户端流式下载文件并把进度写入当前升级类型。"""
         temporary = destination.with_suffix(".part")
         temporary.unlink(missing_ok=True)
-        with self._request().get_stream(url) as response:
+        with self._download_request().get_stream(url) as response:
             if response is None or response.status_code != 200:
                 raise RuntimeError(
                     f"下载更新包失败：HTTP {getattr(response, 'status_code', '无响应')}"

@@ -2,111 +2,178 @@
   "system": {
     "modules": {
       "BangumiModule": {
-        "name": "Bangumi"
+        "name": "Bangumi",
+        "description": "媒體識別、搜尋和探索頁使用的 Bangumi 動畫資料源。"
+      },
+      "AmllModule": {
+        "name": "AMLL TTML",
+        "description": "將 AMLL TTML 服務作為音樂歌詞來源。"
+      },
+      "AniListModule": {
+        "name": "AniList",
+        "description": "媒體識別、搜尋和探索頁使用的 AniList 動畫資料源。"
       },
       "DiscordModule": {
-        "name": "Discord"
+        "name": "Discord",
+        "description": "將系統事件和任務結果傳送到 Discord。"
       },
       "DoubanModule": {
-        "name": "豆瓣"
+        "name": "豆瓣",
+        "description": "電影、電視劇和音樂識別、搜尋及探索榜單使用的豆瓣資料源。"
       },
       "EmbyModule": {
-        "name": "Emby"
+        "name": "Emby",
+        "description": "媒體伺服器適配器：同步 Emby 媒體庫並執行重新整理、播放等操作。"
       },
       "FanartModule": {
-        "name": "Fanart"
+        "name": "Fanart",
+        "description": "媒體刮削時補充 Fanart.tv 海報、背景和藝術圖。"
       },
       "FeishuModule": {
-        "name": "飛書"
+        "name": "飛書",
+        "description": "將系統事件和任務結果傳送到飛書機器人。"
       },
       "FileManagerModule": {
-        "name": "檔案整理"
+        "name": "檔案整理",
+        "description": "媒體整理流程實際執行檔案讀寫、複製、移動、重新命名和刪除。"
       },
       "FilterModule": {
-        "name": "過濾器"
+        "name": "過濾器",
+        "description": "在搜尋、下載和整理流程中執行過濾規則、識別詞和發布組比對。"
       },
       "ImdbModule": {
-        "name": "IMDb"
+        "name": "IMDb",
+        "description": "電影和電視劇識別、搜尋使用的 IMDb 資料源。"
       },
       "IndexerModule": {
-        "name": "站點索引"
+        "name": "站點索引",
+        "description": "負責站點索引和資源搜尋，向下載流程輸出站點資源。"
+      },
+      "ListenBrainzModule": {
+        "name": "ListenBrainz",
+        "description": "為音樂推薦頁提供 ListenBrainz 榜單和推薦資料。"
       },
       "JellyfinModule": {
-        "name": "Jellyfin"
+        "name": "Jellyfin",
+        "description": "媒體伺服器適配器：同步 Jellyfin 媒體庫並執行重新整理、播放等操作。"
       },
       "MediaVaultModule": {
-        "name": "MediaVault"
+        "name": "MediaVault",
+        "description": "媒體伺服器適配器：連接 MediaVault 並同步媒體庫資訊。"
+      },
+      "LrclibModule": {
+        "name": "LRCLIB",
+        "description": "為音樂刮削提供 LRCLIB 歌詞查詢。"
+      },
+      "MusicBrainzModule": {
+        "name": "MusicBrainz",
+        "description": "音樂核心識別資料源：負責音樂搜尋、錄音、專輯和藝人識別及元資料。"
       },
       "PlexModule": {
-        "name": "Plex"
+        "name": "Plex",
+        "description": "媒體伺服器適配器：同步 Plex 媒體庫並執行重新整理、播放等操作。"
       },
       "PostgreSQLModule": {
-        "name": "PostgreSQL"
+        "name": "PostgreSQL",
+        "description": "保存系統設定、媒體、訂閱和任務等應用程式持久化資料。"
       },
       "QbittorrentModule": {
-        "name": "Qbittorrent"
+        "name": "Qbittorrent",
+        "description": "下載器適配器：連接 qBittorrent 並建立、暫停和管理下載任務。"
       },
       "QQBotModule": {
-        "name": "QQ"
+        "name": "QQ",
+        "description": "將系統事件和任務結果傳送到 QQ 機器人。"
       },
       "RedisModule": {
-        "name": "Redis 快取"
+        "name": "Redis 快取",
+        "description": "保存快取、佇列和跨程序執行狀態，支援任務排程與即時進度。"
       },
       "RtorrentModule": {
-        "name": "Rtorrent"
+        "name": "Rtorrent",
+        "description": "下載器適配器：連接 rTorrent 並建立、暫停和管理下載任務。"
       },
       "SlackModule": {
-        "name": "Slack"
+        "name": "Slack",
+        "description": "將系統事件和任務結果傳送到 Slack。"
       },
       "SubtitleModule": {
-        "name": "站點字幕"
+        "name": "站點字幕",
+        "description": "從站點搜尋和下載字幕，並參與媒體整理流程。"
       },
       "SynologyChatModule": {
-        "name": "Synology Chat"
+        "name": "Synology Chat",
+        "description": "將系統事件和任務結果傳送到 Synology Chat。"
       },
       "TelegramModule": {
-        "name": "Telegram"
+        "name": "Telegram",
+        "description": "將系統事件和任務結果傳送到 Telegram 機器人。"
       },
       "TheMovieDbModule": {
-        "name": "TheMovieDb"
+        "name": "TheMovieDb",
+        "description": "影視核心識別資料源：負責電影、電視劇搜尋識別，以及探索、推薦、人物和合集資料。"
       },
       "TheTvDbModule": {
-        "name": "TheTvDb"
+        "name": "TheTvDb",
+        "description": "電視劇識別和輔助資訊使用的 TheTvDb 資料源。"
+      },
+      "TheAudioDbModule": {
+        "name": "TheAudioDB",
+        "description": "音樂識別和搜尋使用的 TheAudioDB 輔助資料源。"
       },
       "TransmissionModule": {
-        "name": "Transmission"
+        "name": "Transmission",
+        "description": "下載器適配器：連接 Transmission 並建立、暫停和管理下載任務。"
       },
       "TrimeMediaModule": {
-        "name": "飛牛影視"
+        "name": "飛牛影視",
+        "description": "媒體伺服器適配器：連接飛牛影視並同步媒體庫資訊。"
       },
       "UgreenModule": {
-        "name": "綠聯影視"
+        "name": "綠聯影視",
+        "description": "媒體伺服器適配器：連接綠聯影視並同步媒體庫資訊。"
       },
       "VoceChatModule": {
-        "name": "VoceChat"
+        "name": "VoceChat",
+        "description": "將系統事件和任務結果傳送到 VoceChat。"
       },
       "WebPushModule": {
-        "name": "WebPush"
+        "name": "WebPush",
+        "description": "透過瀏覽器 Web Push 向使用者推送系統訊息。"
       },
       "WechatModule": {
-        "name": "企業微信"
+        "name": "企業微信",
+        "description": "將系統事件和任務結果傳送到企業微信機器人。"
       },
       "WechatClawBotModule": {
-        "name": "微信 ClawBot"
+        "name": "微信 ClawBot",
+        "description": "將系統事件和任務結果傳送到微信 ClawBot。"
       },
       "ZSpaceModule": {
-        "name": "極影視"
+        "name": "極影視",
+        "description": "媒體伺服器適配器：連接極影視並同步媒體庫資訊。"
       }
     },
     "module_test": {
       "unsupported": "模組不支援測試"
+    },
+    "storage": {
+      "local": "本地",
+      "alipan": "阿里雲盤",
+      "u115": "115網盤",
+      "rclone": "RClone",
+      "alist": "AList",
+      "alistgo": "AList",
+      "smb": "SMB網路共享"
     }
   },
   "messages": {
+    "整理任务已清理": "整理任務已清理",
     "暂无到期订阅，无需搜索": "暫無到期訂閱，無需搜尋",
     "调用工具失败": "調用工具失敗",
     "媒体来源和媒体 ID 必须同时提供": "媒體來源和媒體 ID 必須同時提供",
     "media_source 和 media_id 必须同时提供": "media_source 和 media_id 必須同時提供",
+    "不支持的分类策略模板": "不支援的分類策略範本",
     "模块不支持测试": "模組不支援測試",
     "网络请求失败": "網路請求失敗",
     "TMDB请求失败": "TMDB 請求失敗",
@@ -151,6 +218,7 @@
     "未识别到艺术家信息": "未識別到藝術家資訊",
     "音乐实体类型无效，仅支持 recording 或 album": "音樂實體類型無效，僅支援 recording 或 album",
     "音乐下载只能使用音乐元数据源": "音樂下載只能使用音樂中繼資料來源",
+    "艺术家合集只能使用音乐元数据源": "藝術家合集只能使用音樂中繼資料來源",
     "音乐重新识别只能使用音乐元数据源": "音樂重新識別只能使用音樂中繼資料來源",
     "读取数据库备份列表失败，请查看日志": "讀取資料庫備份清單失敗，請查看日誌",
     "创建数据库备份失败，请查看日志": "建立資料庫備份失敗，請查看日誌",
@@ -178,6 +246,7 @@
     "媒体ID格式无效": "媒體ID格式無效",
     "MusicBrainz 只能用于音乐刮削": "MusicBrainz 只能用於音樂刮削",
     "音乐元数据源只能用于音乐刮削": "音樂中繼資料來源只能用於音樂刮削",
+    "艺术家合集任务添加失败": "藝術家合集任務新增失敗",
     "刮削失败，无法识别音乐信息": "刮削失敗，無法識別音樂資訊",
     "刮削失败，无法识别媒体信息": "刮削失敗，無法識別媒體資訊",
     "刮削路径不存在": "刮削路徑不存在",
@@ -202,6 +271,8 @@
     "验证失败": "驗證失敗",
     "没有传入仓库地址，无法正确安装插件，请检查配置": "未傳入倉庫位址，無法正確安裝插件，請檢查設定",
     "插件分身创建成功": "插件分身建立成功",
+    "请至少选择一项要清理的内容": "請至少選擇一項要清理的內容",
+    "默认调用目标正被并发修改，请重试": "預設呼叫目標正被並行修改，請重試",
     "未识别到豆瓣媒体信息": "未識別到豆瓣媒體資訊",
     "未识别到TMDB媒体信息": "未識別到 TMDB 媒體資訊",
     "未知的媒体ID": "未知的媒體 ID",
@@ -257,6 +328,7 @@
     "用户名不能为空": "使用者名稱不能為空",
     "用户名已被使用": "使用者名稱已被使用",
     "系统已经完成初始化": "系統已完成初始化",
+    "SUPERUSER 已由配置文件或环境变量固定，初始化用户名不能修改": "SUPERUSER 已由設定檔或環境變數固定，初始化使用者名稱不能修改",
     "必须保留至少一个启用的超级管理员": "必須保留至少一個啟用的超級管理員",
     "用户不存在": "使用者不存在",
     "已存在相同名称的工作流": "已存在相同名稱的工作流",
@@ -969,6 +1041,10 @@
     {
       "source": "创建插件分身失败：{reason}",
       "target": "建立插件分身失敗：{reason}"
+    },
+    {
+      "source": "实例 ID 非法：{reason}",
+      "target": "實例 ID 非法：{reason}"
     },
     {
       "source": "请先卸载该插件的分身：{instances}",

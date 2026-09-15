@@ -14,7 +14,7 @@ from app.application.configuration import (
 )
 from app.chain._messaging import MessageProcessingMixin, NotificationMixin
 from app.chain._recognition import RecognitionMixin
-from app.domain.context import Context, MediaInfo, MusicInfo, SubtitleInfo, TorrentInfo
+from app.domain.context import Context, MediaInfo, MusicArtistInfo, MusicInfo, SubtitleInfo, TorrentInfo
 from app.domain.meta.metabase import MetaBase
 from app.runtime.log import logger
 from app.schemas.context import MediaPerson
@@ -72,7 +72,8 @@ class ChainBase(RecognitionMixin, MessageProcessingMixin, NotificationMixin, met
         self.download_failure_repository = context.download_failure_repository
         self.user_repository = context.user_repository
         self.classification_service = context.classification_service
-        self.runtime_config = context.configuration
+        self._runtime_config_provider = context.configuration_provider
+        self._runtime_config = context.configuration
         self.stop_state = context.stop_state
         self.system_service = context.system_service
         self.durable_event_writer = context.durable_event_writer
@@ -88,15 +89,25 @@ class ChainBase(RecognitionMixin, MessageProcessingMixin, NotificationMixin, met
 
     @property
     def runtime_config(self) -> ChainRuntimeConfig:
-        """返回实例快照；兼容绕过构造器的旧调用并按需取得当前快照。"""
-        configuration = getattr(self, "_runtime_config", None)
+        """返回当前运行配置；显式注入实例仍保留稳定快照语义。"""
+        provider = cast(
+            Optional[Callable[[], ChainRuntimeConfig]],
+            getattr(self, "_runtime_config_provider", None),
+        )
+        if provider is not None:
+            return provider()
+        configuration = cast(
+            Optional[ChainRuntimeConfig],
+            getattr(self, "_runtime_config", None),
+        )
         if configuration is None:
             return get_chain_runtime_config_snapshot()
         return configuration
 
     @runtime_config.setter
     def runtime_config(self, configuration: ChainRuntimeConfig) -> None:
-        """保存显式注入的 Chain 配置快照。"""
+        """保存显式注入的 Chain 配置快照并停止自动配置读取。"""
+        self._runtime_config_provider = None
         self._runtime_config = configuration
 
     def load_cache(self, filename: str) -> Any:
@@ -534,23 +545,23 @@ class ChainBase(RecognitionMixin, MessageProcessingMixin, NotificationMixin, met
 
     def search_persons(
         self, name: str, media_source: Optional[MediaSourceSelection] = None
-    ) -> Optional[List[MediaPerson]]:
+    ) -> Optional[List[Union[MediaPerson, MusicArtistInfo]]]:
         """
-        搜索人物信息
-        :param name:  人物名称
+        搜索影视人物和音乐艺术家
+        :param name:  人物或艺术家名称
         :param media_source: 请求级搜索数据源
-        :return: 人物信息列表
+        :return: 影视人物或音乐艺术家信息列表
         """
         return self.run_module("search_persons", name=name, media_source=media_source)
 
     async def async_search_persons(
         self, name: str, media_source: Optional[MediaSourceSelection] = None
-    ) -> Optional[List[MediaPerson]]:
+    ) -> Optional[List[Union[MediaPerson, MusicArtistInfo]]]:
         """
-        搜索人物信息（异步版本）
-        :param name:  人物名称
+        搜索影视人物和音乐艺术家（异步版本）
+        :param name:  人物或艺术家名称
         :param media_source: 请求级搜索数据源
-        :return: 人物信息列表
+        :return: 影视人物或音乐艺术家信息列表
         """
         return await self.async_run_module("async_search_persons", name=name, media_source=media_source)
 

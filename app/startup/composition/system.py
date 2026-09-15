@@ -121,15 +121,27 @@ class _FileLogAdapter(SystemLogPort):
         async with aiofiles.open(path, mode="r", encoding="utf-8", errors="replace") as file:
             await file.seek(0, 2)
             previous_size = (await asyncio.to_thread(path.stat)).st_size
+            pending = ""
             while not runtime_stop_state.is_system_stopped:
                 if await disconnected():
                     break
                 current_size = (await asyncio.to_thread(path.stat)).st_size
+                if current_size < previous_size:
+                    await file.seek(0)
+                    previous_size = 0
+                    pending = ""
                 if current_size > previous_size:
-                    line = (await file.readline()).strip()
-                    if line:
-                        yield line
+                    pending += await file.read()
                     previous_size = current_size
+                    fragments = pending.splitlines(keepends=True)
+                    if fragments and not fragments[-1].endswith(("\n", "\r")):
+                        pending = fragments.pop()
+                    else:
+                        pending = ""
+                    for fragment in fragments:
+                        line = fragment.strip()
+                        if line:
+                            yield line
                 else:
                     await asyncio.sleep(0.5)
 
@@ -190,12 +202,12 @@ class _ConfigurationEventAdapter(ConfigurationEventPort):
     """把已提交设置变更发布到宿主事件总线。"""
 
     async def publish(self, key: Any, value: Any = None) -> None:
-        """同步失效派生缓存后发布兼容 ConfigChanged 事件。"""
+        """同步失效派生缓存并等待全部配置重载处理器完成。"""
         payload = ConfigChangeEventData(key=key, value=value, change_type="update")
         if payload.key.intersection(_RUST_METAINFO_OPTION_SETTING_KEYS):
-            # 广播事件异步消费，必须在写入入口返回前失效缓存，避免下一次识别读取旧配置。
+            # 必须在写入入口返回前失效缓存，避免下一次识别读取旧配置。
             clear_rust_parse_options_cache()
-        await eventmanager.async_send_event(
+        await eventmanager.async_send_event_strict(
             etype=EventType.ConfigChanged,
             data=payload,
         )

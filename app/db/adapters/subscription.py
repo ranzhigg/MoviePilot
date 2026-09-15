@@ -82,6 +82,7 @@ def _project_subscription(record: Subscribe) -> SubscriptionSnapshot:
         media_id=record.media_id,
         music_type=record.music_type,
         total_tracks=record.total_tracks,
+        downloaded_tracks=cast(Optional[builtins.list[str]], record.downloaded_tracks),
         season=record.season,
         poster=record.poster,
         backdrop=record.backdrop,
@@ -372,7 +373,6 @@ class TransactionalSubscriptionRepository(_TransactionalSubscriptionWriter):
 
         return await self._async_read(operation)
 
-
     async def async_list(
         self,
         state: Optional[str] = None,
@@ -462,6 +462,7 @@ class TransactionalSubscriptionRepository(_TransactionalSubscriptionWriter):
             return [_project_subscription(record) for record in records]
 
         return await self._async_read(operation)
+
 
 class TransactionalSubscriptionHistoryRepository:
     """以独立短 AsyncSession 实现 Agent 等后台入口的订阅历史查询。"""
@@ -599,6 +600,16 @@ class SessionSubscriptionRepository:
     def list(self, state: Optional[str] = None) -> builtins.list[SubscriptionSnapshot]:
         """同步按可选状态读取订阅快照。"""
         return [_project_subscription(record) for record in self._sync_repository().list(state)]
+
+    def list_by_media_identity(
+        self,
+        media_source: MediaSource,
+        media_id: str,
+        music_type: Optional[str] = None,
+    ) -> builtins.list[SubscriptionSnapshot]:
+        """同步按规范媒体身份读取订阅快照。"""
+        records = self._sync_repository().list_by_media_identity(media_source, media_id, music_type)
+        return [_project_subscription(record) for record in records]
 
     async def async_get(self, subscribe_id: int) -> Optional[SubscriptionSnapshot]:
         """异步按主键读取订阅快照。"""
@@ -776,14 +787,19 @@ class SessionSubscriptionRepository:
         self,
         username: Optional[str],
         state: str,
+        mtype: Optional[str] = None,
     ) -> builtins.list[int]:
-        """异步读取用户或管理员全局范围内指定状态的订阅主键。"""
+        """异步读取用户或管理员指定媒体类型范围内的订阅主键。"""
         snapshots = (
-            await self.async_list_by_username(username, state)
+            await self.async_list_by_username(username, state, mtype=mtype)
             if username is not None
             else await self.async_list(state)
         )
-        return [snapshot.id for snapshot in snapshots]
+        return [
+            snapshot.id
+            for snapshot in snapshots
+            if snapshot.id and (mtype is None or snapshot.type == mtype)
+        ]
 
     async def stage_delete(self, subscribe_id: int) -> None:
         """异步暂存删除订阅。"""

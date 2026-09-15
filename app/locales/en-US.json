@@ -2,107 +2,173 @@
   "system": {
     "modules": {
       "BangumiModule": {
-        "name": "Bangumi"
+        "name": "Bangumi",
+        "description": "Bangumi anime data source for media identification, search, and discovery."
+      },
+      "AmllModule": {
+        "name": "AMLL TTML",
+        "description": "Uses AMLL TTML as a lyrics source for music scraping."
+      },
+      "AniListModule": {
+        "name": "AniList",
+        "description": "AniList anime data source for media identification, search, and discovery."
       },
       "DiscordModule": {
-        "name": "Discord"
+        "name": "Discord",
+        "description": "Sends system events and task results to Discord."
       },
       "DoubanModule": {
-        "name": "Douban"
+        "name": "Douban",
+        "description": "Douban data source for movie, TV, and music identification, search, and discovery lists."
       },
       "EmbyModule": {
-        "name": "Emby"
+        "name": "Emby",
+        "description": "Media-server adapter that synchronizes Emby libraries and runs refresh or playback actions."
       },
       "FanartModule": {
-        "name": "Fanart"
+        "name": "Fanart",
+        "description": "Adds Fanart.tv posters, backdrops, and artwork during media scraping."
       },
       "FeishuModule": {
-        "name": "Feishu"
+        "name": "Feishu",
+        "description": "Sends system events and task results to Feishu bots."
       },
       "FileManagerModule": {
-        "name": "File Organization"
+        "name": "File Organization",
+        "description": "Executes the file reads, copies, moves, renames, and deletions used by media organization."
       },
       "FilterModule": {
-        "name": "Filter"
+        "name": "Filter",
+        "description": "Applies filter rules, recognition terms, and release-group matching during search, download, and organization."
       },
       "ImdbModule": {
-        "name": "IMDb"
+        "name": "IMDb",
+        "description": "IMDb data source for movie and TV identification and search."
       },
       "IndexerModule": {
-        "name": "Site Indexer"
+        "name": "Site Indexer",
+        "description": "Indexes sites and searches resources, supplying parsed results to download workflows."
+      },
+      "ListenBrainzModule": {
+        "name": "ListenBrainz",
+        "description": "Supplies ListenBrainz charts and recommendation data for the music discovery page."
       },
       "JellyfinModule": {
-        "name": "Jellyfin"
+        "name": "Jellyfin",
+        "description": "Media-server adapter that synchronizes Jellyfin libraries and runs refresh or playback actions."
       },
       "MediaVaultModule": {
-        "name": "MediaVault"
+        "name": "MediaVault",
+        "description": "Media-server adapter that connects to MediaVault and synchronizes its library."
+      },
+      "LrclibModule": {
+        "name": "LRCLIB",
+        "description": "Looks up LRCLIB lyrics during music scraping."
+      },
+      "MusicBrainzModule": {
+        "name": "MusicBrainz",
+        "description": "Core music identification data source for music search, recordings, releases, artists, and metadata."
       },
       "PlexModule": {
-        "name": "Plex"
+        "name": "Plex",
+        "description": "Media-server adapter that synchronizes Plex libraries and runs refresh or playback actions."
       },
       "PostgreSQLModule": {
-        "name": "PostgreSQL"
+        "name": "PostgreSQL",
+        "description": "Persists system settings, media, subscriptions, tasks, and other application data."
       },
       "QbittorrentModule": {
-        "name": "qBittorrent"
+        "name": "qBittorrent",
+        "description": "Downloader adapter that connects to qBittorrent and creates, pauses, and manages tasks."
       },
       "QQBotModule": {
-        "name": "QQ"
+        "name": "QQ",
+        "description": "Sends system events and task results to QQ bots."
       },
       "RedisModule": {
-        "name": "Redis Cache"
+        "name": "Redis Cache",
+        "description": "Stores cache, queues, and cross-process runtime state for scheduling and live progress."
       },
       "RtorrentModule": {
-        "name": "rTorrent"
+        "name": "rTorrent",
+        "description": "Downloader adapter that connects to rTorrent and creates, pauses, and manages tasks."
       },
       "SlackModule": {
-        "name": "Slack"
+        "name": "Slack",
+        "description": "Sends system events and task results to Slack."
       },
       "SubtitleModule": {
-        "name": "Site Subtitle"
+        "name": "Site Subtitle",
+        "description": "Searches sites for subtitles, downloads them, and feeds them into media organization."
       },
       "SynologyChatModule": {
-        "name": "Synology Chat"
+        "name": "Synology Chat",
+        "description": "Sends system events and task results to Synology Chat."
       },
       "TelegramModule": {
-        "name": "Telegram"
+        "name": "Telegram",
+        "description": "Sends system events and task results to Telegram bots."
       },
       "TheMovieDbModule": {
-        "name": "TheMovieDb"
+        "name": "TheMovieDb",
+        "description": "Core movie and TV data source for identification, search, discovery, recommendations, people, and collections."
       },
       "TheTvDbModule": {
-        "name": "TheTvDb"
+        "name": "TheTvDb",
+        "description": "TheTvDb data source for TV identification and auxiliary metadata."
+      },
+      "TheAudioDbModule": {
+        "name": "TheAudioDB",
+        "description": "TheAudioDB auxiliary data source for music identification and artist search."
       },
       "TransmissionModule": {
-        "name": "Transmission"
+        "name": "Transmission",
+        "description": "Downloader adapter that connects to Transmission and creates, pauses, and manages tasks."
       },
       "TrimeMediaModule": {
-        "name": "Trime Media"
+        "name": "Trime Media",
+        "description": "Media-server adapter that connects to Trime Media and synchronizes its library."
       },
       "UgreenModule": {
-        "name": "UGREEN"
+        "name": "UGREEN",
+        "description": "Media-server adapter that connects to UGREEN Media and synchronizes its library."
       },
       "VoceChatModule": {
-        "name": "VoceChat"
+        "name": "VoceChat",
+        "description": "Sends system events and task results to VoceChat."
       },
       "WebPushModule": {
-        "name": "WebPush"
+        "name": "WebPush",
+        "description": "Pushes system messages to users through browser Web Push."
       },
       "WechatModule": {
-        "name": "WeCom"
+        "name": "WeCom",
+        "description": "Sends system events and task results to WeCom bots."
       },
       "WechatClawBotModule": {
-        "name": "WeChat ClawBot"
+        "name": "WeChat ClawBot",
+        "description": "Sends system events and task results to WeChat ClawBot."
       },
       "ZSpaceModule": {
-        "name": "Zspace"
+        "name": "Zspace",
+        "description": "Media-server adapter that connects to Zspace and synchronizes its library."
       }
     },
     "module_test": {
       "unsupported": "Module does not support testing"
+    },
+    "storage": {
+      "local": "Local",
+      "alipan": "Aliyun Drive",
+      "u115": "115 Cloud",
+      "rclone": "RClone",
+      "alist": "OpenList",
+      "alistgo": "AList",
+      "smb": "SMB Network Share"
     }
   },
   "messages": {
+    "整理任务已清理": "The organization task has been cleared",
     "暂无到期订阅，无需搜索": "No subscriptions are due for search",
     "调用工具失败": "Tool call failed",
     "无效的媒体来源": "Invalid media source",
@@ -115,6 +181,7 @@
     "分类策略已被其他会话更新，请重新加载或合并后再发布": "The classification policy was updated by another session. Reload or merge before publishing again",
     "分类策略校验失败": "Classification policy validation failed",
     "分类策略转换失败": "Classification policy conversion failed",
+    "不支持的分类策略模板": "Unsupported classification policy template",
     "模块不支持测试": "Module does not support testing",
     "网络请求失败": "Network request failed",
     "TMDB请求失败": "TMDB request failed",
@@ -159,6 +226,7 @@
     "未识别到艺术家信息": "Unable to recognize artist information",
     "音乐实体类型无效，仅支持 recording 或 album": "Invalid music entity type; only recording or album is supported",
     "音乐下载只能使用音乐元数据源": "Music downloads can only use music metadata sources",
+    "艺术家合集只能使用音乐元数据源": "Artist collections can only use music metadata sources",
     "音乐重新识别只能使用音乐元数据源": "Music re-identification can only use music metadata sources",
     "读取数据库备份列表失败，请查看日志": "Failed to load database backups. Check the logs for details",
     "创建数据库备份失败，请查看日志": "Failed to create the database backup. Check the logs for details",
@@ -186,6 +254,7 @@
     "媒体ID格式无效": "Invalid media ID format",
     "MusicBrainz 只能用于音乐刮削": "MusicBrainz can only be used for music scraping",
     "音乐元数据源只能用于音乐刮削": "Music metadata sources can only be used for music scraping",
+    "艺术家合集任务添加失败": "Failed to add the artist collection download task",
     "刮削失败，无法识别音乐信息": "Scraping failed: unable to recognize music information",
     "刮削失败，无法识别媒体信息": "Scraping failed: unable to recognize media information",
     "刮削路径不存在": "Scraping path does not exist",
@@ -210,6 +279,8 @@
     "验证失败": "Verification failed",
     "没有传入仓库地址，无法正确安装插件，请检查配置": "No repository URL was provided, so the plugin cannot be installed. Please check the configuration",
     "插件分身创建成功": "Plugin clone created successfully",
+    "请至少选择一项要清理的内容": "Select at least one item to purge",
+    "默认调用目标正被并发修改，请重试": "The default call target is being modified concurrently, please retry",
     "未识别到豆瓣媒体信息": "Unable to recognize Douban media information",
     "未识别到TMDB媒体信息": "Unable to recognize TMDB media information",
     "未知的媒体ID": "Unknown media ID",
@@ -265,6 +336,7 @@
     "用户名不能为空": "Username cannot be empty",
     "用户名已被使用": "Username is already in use",
     "系统已经完成初始化": "The system has already been initialized",
+    "SUPERUSER 已由配置文件或环境变量固定，初始化用户名不能修改": "SUPERUSER is fixed by the configuration file or environment variable; the initialization username cannot be changed",
     "必须保留至少一个启用的超级管理员": "At least one active superuser must remain",
     "用户不存在": "User does not exist",
     "已存在相同名称的工作流": "A workflow with the same name already exists",
@@ -983,6 +1055,10 @@
     {
       "source": "创建插件分身失败：{reason}",
       "target": "Failed to create plugin clone: {reason}"
+    },
+    {
+      "source": "实例 ID 非法：{reason}",
+      "target": "Invalid instance ID: {reason}"
     },
     {
       "source": "请先卸载该插件的分身：{instances}",

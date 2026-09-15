@@ -119,6 +119,12 @@ API_FIRST_BATCH_OPERATION_SPECS: tuple[ApiOperationSpec, ...] = (
     _spec("subscription.history"),
     _write("subscription.delete", effect=ActionEffect.DESTRUCTIVE_WRITE, recovery=_DELETE_RECOVERABLE),
     _spec("download.add", effect=ActionEffect.EXTERNAL_SIDE_EFFECT, confirmation=_CONFIRM, recovery=_IDEMPOTENT),
+    _spec(
+        "download.artist_collection",
+        effect=ActionEffect.EXTERNAL_SIDE_EFFECT,
+        confirmation=_CONFIRM,
+        recovery=_IDEMPOTENT,
+    ),
     _spec("download.tasks.active"),
     _spec("download.clients"),
     _spec("download.paths"),
@@ -213,6 +219,8 @@ API_PARITY_OPERATION_SPECS: tuple[ApiOperationSpec, ...] = (
     _write("filter.group.update", recovery=RecoveryMode.TRANSACTION),
     _write("filter.group.delete", effect=ActionEffect.DESTRUCTIVE_WRITE, recovery=RecoveryMode.TRANSACTION),
     _admin_read("plugin.data", sensitivity=ResultSensitivity.PRIVATE),
+    _admin_read("config.system.list", sensitivity=ResultSensitivity.PRIVATE),
+    _admin_read("config.system.describe", sensitivity=ResultSensitivity.PRIVATE),
     _admin_read("config.system.get", sensitivity=ResultSensitivity.PRIVATE),
     _write("config.system.update", recovery=RecoveryMode.TRANSACTION, sensitivity=ResultSensitivity.PRIVATE),
     _spec(
@@ -298,8 +306,17 @@ API_EXTENDED_OPERATION_SPECS: tuple[ApiOperationSpec, ...] = (
     _admin_read("dashboard.network"),
     _spec("media.sources"),
     _spec("media.recognize_file"),
-    _spec("media.category.config.get"),
-    _spec("media.categories"),
+    _admin_read("media.cache.get", sensitivity=ResultSensitivity.PRIVATE),
+    _write("media.cache.delete", effect=ActionEffect.DESTRUCTIVE_WRITE, recovery=RecoveryMode.NONE),
+    _write("media.cache.clear", effect=ActionEffect.DESTRUCTIVE_WRITE, recovery=RecoveryMode.NONE),
+    _spec("media.classification.fields"),
+    _spec("media.classification.policy.get"),
+    _admin_read("media.classification.policy.validate"),
+    _spec("media.classification.policy.preview"),
+    _admin_read("media.classification.policy.impact", sensitivity=ResultSensitivity.PRIVATE),
+    _admin_read("media.classification.policy.history", sensitivity=ResultSensitivity.PRIVATE),
+    _write("media.classification.policy.update", recovery=RecoveryMode.TRANSACTION),
+    _write("media.classification.policy.rollback", recovery=RecoveryMode.TRANSACTION),
     _spec("media.episode_groups"),
     _spec("media.episode_group.seasons"),
     _spec("media.seasons"),
@@ -329,6 +346,7 @@ API_EXTENDED_OPERATION_SPECS: tuple[ApiOperationSpec, ...] = (
         confirmation=_CONFIRM,
         recovery=RecoveryMode.RECONCILE,
     ),
+    _write("site.cookie.set", sensitivity=ResultSensitivity.PRIVATE),
     _write(
         "site.reset",
         effect=ActionEffect.DESTRUCTIVE_WRITE,
@@ -389,6 +407,14 @@ API_EXTENDED_OPERATION_SPECS: tuple[ApiOperationSpec, ...] = (
     ),
     _spec("subscription.user.list"),
     _spec("subscription.files", result_sensitivity=ResultSensitivity.PRIVATE),
+    _spec("subscription.execution.list", result_sensitivity=ResultSensitivity.PRIVATE),
+    _spec("subscription.execution.get", result_sensitivity=ResultSensitivity.PRIVATE),
+    _user_write(
+        "subscription.execution.cancel",
+        effect=ActionEffect.EXTERNAL_SIDE_EFFECT,
+        recovery=RecoveryMode.RECONCILE,
+        sensitivity=ResultSensitivity.PRIVATE,
+    ),
     _user_write("subscription.share", effect=ActionEffect.EXTERNAL_SIDE_EFFECT, recovery=RecoveryMode.RECONCILE),
     _user_write(
         "subscription.share.delete",
@@ -509,6 +535,8 @@ API_EXTENDED_OPERATION_SPECS: tuple[ApiOperationSpec, ...] = (
     _spec("system.network.targets"),
     _spec("system.network.test", effect=ActionEffect.EXTERNAL_SIDE_EFFECT, recovery=_IDEMPOTENT),
     _spec("system.module.list"),
+    _spec("system.module.catalog"),
+    _admin_read("system.module.settings"),
     _spec("system.module.test", effect=ActionEffect.EXTERNAL_SIDE_EFFECT, recovery=_IDEMPOTENT),
     _spec(
         "plugin.market.sync_wiki",
@@ -529,6 +557,7 @@ API_EXTENDED_OPERATION_SPECS: tuple[ApiOperationSpec, ...] = (
         effect=ActionEffect.DESTRUCTIVE_WRITE,
         recovery=RecoveryMode.MANUAL_ONLY,
     ),
+    _admin_read("plugin.clone.restorable", sensitivity=ResultSensitivity.PRIVATE),
     _write("plugin.clone", effect=ActionEffect.EXTERNAL_SIDE_EFFECT, recovery=RecoveryMode.RECONCILE),
     _spec("config.user.get", result_sensitivity=ResultSensitivity.PRIVATE),
     _spec("config.public.get"),
@@ -541,6 +570,18 @@ API_EXTENDED_OPERATION_SPECS: tuple[ApiOperationSpec, ...] = (
     _write("plugin.folder.plugins.update", recovery=RecoveryMode.TRANSACTION),
     _write("plugin.folder.plugin.assign", recovery=RecoveryMode.TRANSACTION),
     _write("plugin.folder.plugin.remove", recovery=RecoveryMode.TRANSACTION),
+    _admin_read("plugin.loglevel.get", sensitivity=ResultSensitivity.PRIVATE),
+    _write("plugin.loglevel.set"),
+    _write("plugin.loglevel.clear"),
+    _write("plugin.default_target.set"),
+    _write("plugin.default_target.clear"),
+    _write("plugin.instance.set_enabled"),
+    # 彻底清理按勾选范围真删用户数据且不可回滚，与重置同档：要确认、且只能人工补救
+    _write(
+        "plugin.instance.purge",
+        effect=ActionEffect.DESTRUCTIVE_WRITE,
+        recovery=RecoveryMode.MANUAL_ONLY,
+    ),
 )
 
 
@@ -582,6 +623,7 @@ API_OPERATION_ROUTES: dict[str, ApiOperationRoute] = {
     "subscription.history": ApiOperationRoute("GET", "/api/v1/subscribe/history/{mtype}"),
     "subscription.delete": ApiOperationRoute("DELETE", "/api/v1/subscribe/{subscribe_id}"),
     "download.add": ApiOperationRoute("POST", "/api/v1/download/add"),
+    "download.artist_collection": ApiOperationRoute("POST", "/api/v1/download/artist-collection"),
     "download.tasks.active": ApiOperationRoute("GET", "/api/v1/download/"),
     "download.clients": ApiOperationRoute("GET", "/api/v1/download/clients"),
     "download.paths": ApiOperationRoute("GET", "/api/v1/download/paths"),
@@ -630,6 +672,10 @@ API_OPERATION_ROUTES: dict[str, ApiOperationRoute] = {
     "filter.group.update": ApiOperationRoute("PUT", "/api/v1/rule/groups/{name}"),
     "filter.group.delete": ApiOperationRoute("DELETE", "/api/v1/rule/groups/{name}"),
     "plugin.data": ApiOperationRoute("GET", "/api/v1/plugin/runtime/{plugin_id}/data"),
+    "config.system.list": ApiOperationRoute("GET", "/api/v1/system/settings/catalog"),
+    "config.system.describe": ApiOperationRoute(
+        "GET", "/api/v1/system/settings/describe/{setting_key}"
+    ),
     "config.system.get": ApiOperationRoute("GET", "/api/v1/system/settings"),
     "config.system.update": ApiOperationRoute("POST", "/api/v1/system/settings"),
     "slash.run": ApiOperationRoute("POST", "/api/v1/message/agent/commands/run"),
@@ -652,8 +698,19 @@ API_OPERATION_ROUTES: dict[str, ApiOperationRoute] = {
     "dashboard.network": ApiOperationRoute("GET", "/api/v1/dashboard/network"),
     "media.sources": ApiOperationRoute("GET", "/api/v1/media/source"),
     "media.recognize_file": ApiOperationRoute("GET", "/api/v1/media/recognize_file"),
-    "media.category.config.get": ApiOperationRoute("GET", "/api/v1/media/category/config"),
-    "media.categories": ApiOperationRoute("GET", "/api/v1/media/category"),
+    "media.cache.get": ApiOperationRoute("GET", "/api/v1/tmdb/cache"),
+    "media.cache.delete": ApiOperationRoute("DELETE", "/api/v1/tmdb/cache/{cache_key}"),
+    "media.cache.clear": ApiOperationRoute("DELETE", "/api/v1/tmdb/cache"),
+    "media.classification.fields": ApiOperationRoute("GET", "/api/v1/media/classification/fields"),
+    "media.classification.policy.get": ApiOperationRoute("GET", "/api/v1/media/classification/policy"),
+    "media.classification.policy.update": ApiOperationRoute("PUT", "/api/v1/media/classification/policy"),
+    "media.classification.policy.validate": ApiOperationRoute("POST", "/api/v1/media/classification/validate"),
+    "media.classification.policy.preview": ApiOperationRoute("POST", "/api/v1/media/classification/preview"),
+    "media.classification.policy.impact": ApiOperationRoute("POST", "/api/v1/media/classification/impact"),
+    "media.classification.policy.history": ApiOperationRoute("GET", "/api/v1/media/classification/history"),
+    "media.classification.policy.rollback": ApiOperationRoute(
+        "POST", "/api/v1/media/classification/rollback/{revision}"
+    ),
     "media.episode_groups": ApiOperationRoute("GET", "/api/v1/media/groups/{tmdbid}"),
     "media.episode_group.seasons": ApiOperationRoute("GET", "/api/v1/media/group/seasons/{episode_group}"),
     "media.seasons": ApiOperationRoute("GET", "/api/v1/media/seasons"),
@@ -666,6 +723,7 @@ API_OPERATION_ROUTES: dict[str, ApiOperationRoute] = {
     "site.auth.options": ApiOperationRoute("GET", "/api/v1/site/auth"),
     "site.authenticate": ApiOperationRoute("POST", "/api/v1/site/auth"),
     "site.cookiecloud.sync": ApiOperationRoute("POST", "/api/v1/site/cookiecloud"),
+    "site.cookie.set": ApiOperationRoute("POST", "/api/v1/site/cookie/{site_id}/set"),
     "site.reset": ApiOperationRoute("POST", "/api/v1/site/reset"),
     "site.priorities.update": ApiOperationRoute("POST", "/api/v1/site/priorities"),
     "site.userdata.refresh": ApiOperationRoute("POST", "/api/v1/site/userdata/{site_id}"),
@@ -689,6 +747,13 @@ API_OPERATION_ROUTES: dict[str, ApiOperationRoute] = {
     "subscription.history.delete": ApiOperationRoute("DELETE", "/api/v1/subscribe/history/{history_id}"),
     "subscription.user.list": ApiOperationRoute("GET", "/api/v1/subscribe/user/{username}"),
     "subscription.files": ApiOperationRoute("GET", "/api/v1/subscribe/files/{subscribe_id}"),
+    "subscription.execution.list": ApiOperationRoute("GET", "/api/v1/subscribe/execution/batches"),
+    "subscription.execution.get": ApiOperationRoute(
+        "GET", "/api/v1/subscribe/execution/batches/{batch_id}"
+    ),
+    "subscription.execution.cancel": ApiOperationRoute(
+        "PUT", "/api/v1/subscribe/execution/batches/{batch_id}/cancel"
+    ),
     "subscription.share": ApiOperationRoute("POST", "/api/v1/subscribe/share"),
     "subscription.share.delete": ApiOperationRoute("DELETE", "/api/v1/subscribe/share/{share_id}"),
     "subscription.fork": ApiOperationRoute("POST", "/api/v1/subscribe/fork"),
@@ -739,6 +804,8 @@ API_OPERATION_ROUTES: dict[str, ApiOperationRoute] = {
     "system.network.targets": ApiOperationRoute("GET", "/api/v1/system/nettest/targets"),
     "system.network.test": ApiOperationRoute("GET", "/api/v1/system/nettest"),
     "system.module.list": ApiOperationRoute("GET", "/api/v1/system/modulelist"),
+    "system.module.catalog": ApiOperationRoute("GET", "/api/v1/system/module-catalog"),
+    "system.module.settings": ApiOperationRoute("GET", "/api/v1/system/module-settings"),
     "system.module.test": ApiOperationRoute("GET", "/api/v1/system/moduletest/{moduleid}"),
     "plugin.market.sync_wiki": ApiOperationRoute("POST", "/api/v1/system/setting/PLUGIN_MARKET/sync-wiki"),
     "plugin.runtime.status": ApiOperationRoute("GET", "/api/v1/plugin/runtime"),
@@ -750,6 +817,9 @@ API_OPERATION_ROUTES: dict[str, ApiOperationRoute] = {
     "plugin.statistics": ApiOperationRoute("GET", "/api/v1/plugin/statistic"),
     "plugin.reset": ApiOperationRoute("GET", "/api/v1/plugin/reset/{plugin_id}"),
     "plugin.clone": ApiOperationRoute("POST", "/api/v1/plugin/clone/{plugin_id}"),
+    "plugin.clone.restorable": ApiOperationRoute(
+        "GET", "/api/v1/plugin/clone/{plugin_id}/restorable"
+    ),
     "config.user.get": ApiOperationRoute("GET", "/api/v1/system/global/user"),
     "config.public.get": ApiOperationRoute("GET", "/api/v1/system/setting/public/{key}"),
     "system.usage.statistics": ApiOperationRoute("GET", "/api/v1/system/usage/statistic"),
@@ -766,6 +836,25 @@ API_OPERATION_ROUTES: dict[str, ApiOperationRoute] = {
     "plugin.folder.plugin.remove": ApiOperationRoute(
         "DELETE",
         "/api/v1/plugin/folders/{folder_name}/plugins/{plugin_id}",
+    ),
+    "plugin.loglevel.get": ApiOperationRoute("GET", "/api/v1/plugin/loglevel/{plugin_id}"),
+    "plugin.loglevel.set": ApiOperationRoute(
+        "PUT", "/api/v1/plugin/loglevel/{plugin_id}/{instance_id}"
+    ),
+    "plugin.loglevel.clear": ApiOperationRoute(
+        "DELETE", "/api/v1/plugin/loglevel/{plugin_id}/{instance_id}"
+    ),
+    "plugin.default_target.set": ApiOperationRoute(
+        "PUT", "/api/v1/plugin/instances/{plugin_id}/{instance_id}/default_target"
+    ),
+    "plugin.default_target.clear": ApiOperationRoute(
+        "DELETE", "/api/v1/plugin/instances/{plugin_id}/{instance_id}/default_target"
+    ),
+    "plugin.instance.set_enabled": ApiOperationRoute(
+        "POST", "/api/v1/plugin/instance/{instance_id}/enabled"
+    ),
+    "plugin.instance.purge": ApiOperationRoute(
+        "POST", "/api/v1/plugin/instance/{instance_id}/purge"
     ),
 }
 

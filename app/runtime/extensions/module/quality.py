@@ -54,6 +54,7 @@ COMMON_ASSESSED_RULES = frozenset(
 BASELINE_ASSESSED_MODULES = frozenset(
     {
         "acoustid",
+        "amll",
         "anilist",
         "discord",
         "douban",
@@ -69,7 +70,6 @@ BASELINE_ASSESSED_MODULES = frozenset(
         "lrclib",
         "mediavault",
         "musicbrainz",
-        "musixmatch",
         "navidrome",
         "plex",
         "postgresql",

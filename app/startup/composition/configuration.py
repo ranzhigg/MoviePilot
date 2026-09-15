@@ -101,6 +101,12 @@ def publish_configuration(
 ) -> None:
     """发布 HostRuntime 使用的同一配置对象及兼容设置入口。"""
     configure_system_config(composition.system_service)
+    # 统一接管直接 async_set() 写入，避免绕过管理 API 的配置保存没有运行时事件。
+    from app.startup.composition.system import _ConfigurationEventAdapter
+
+    composition.system_service.configure_change_publisher(
+        _ConfigurationEventAdapter().publish
+    )
     configure_user_configuration(composition.user_service)
     configure_runtime_configuration(composition.runtime)
     configure_runtime_settings(composition.settings)
@@ -191,6 +197,7 @@ def build_scheduler_runtime_config(settings: Settings) -> SchedulerRuntimeConfig
         site_link=settings.MP_DOMAIN("#/site"),
         auto_update=settings.MOVIEPILOT_AUTO_UPDATE,
         auto_update_resource=settings.AUTO_UPDATE_RESOURCE,
+        wallpaper=settings.WALLPAPER,
     )
 
 

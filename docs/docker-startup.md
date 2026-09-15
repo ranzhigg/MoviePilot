@@ -383,6 +383,10 @@ Transfer、Workflow 和 MoviePilot Server 服务，注册站点资源版本读�
 `MOVIEPILOT_SAFE_MODE=true` 时跳过标记为 `NORMAL_ONLY` 的插件、调度器、监控、命令和工作流等组件，
 但数据库、路由、核心模块服务和后台诊断入口仍会启动。
 
+插件安装 journal 的启动恢复按插件逐条处理：单个插件的恢复或事实校验失败会记录日志、保留 journal
+供后续重试，并跳过本条恢复，不阻断其他插件和宿主启动；数据库读取或插件恢复服务本身的全局故障仍按
+生命周期组件失败处理。
+
 ### 8.2 数据库就绪边界
 
 数据库准备先读取当前 revision 和代码唯一 head：
@@ -397,7 +401,8 @@ Transfer、Workflow 和 MoviePilot Server 服务，注册站点资源版本读�
 
 ### 8.3 readiness
 
-所有启用的 fail-fast 启动组件成功后，lifespan 才把应用标记为 `ready`。
+所有启用的 fail-fast 启动组件成功后，lifespan 才把应用标记为 `ready`。插件恢复中的单插件失败已在
+组件内部隔离，不会把该组件升级为宿主级启动失败。
 
 Dockerfile 的 `HEALTHCHECK` 每 30 秒请求 `http://127.0.0.1:${PORT}/health/ready`：数据库迁移和完整 lifespan 成功后返回 200；启动、
 失败或关停阶段返回 503。`/health/live` 只表示进程和事件循环仍可响应。
@@ -420,7 +425,8 @@ Python lifespan 会先撤销 readiness，再按组件声明的 `stop_order` 停�
 普通应用重启通过本地 `supervisorctl restart all` 同时重启 Nginx 和后端。确认安装 Release 时，
 `SystemHelper` 只启动 root `moviepilot-update-worker`；worker 先替换 `/app`、`/public` 或站点资源，
 再写入 `moviepilot.pending_supervisor_restart` 并执行 `supervisorctl shutdown`。外层 entrypoint 看到标记后
-重新执行 launcher，加载新代码。Dev 更新仍通过一次性 Dev 标记关闭 Supervisor，再由 entrypoint 调用
+重新执行 launcher，加载新代码。载荷替换期间外层 entrypoint、worker 的控制面调用和所有入口重入都使用 `/`
+作为稳定工作目录，避免旧 `/app` 被删除后产生 `getcwd` 错误。Dev 更新仍通过一次性 Dev 标记关闭 Supervisor，再由 entrypoint 调用
 `update.sh`。这样更新包不会因只重启受管进程而停留在暂存目录；整个过程不访问 Docker API，也不依赖
 Docker restart policy。
 

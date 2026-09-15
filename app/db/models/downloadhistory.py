@@ -191,8 +191,10 @@ class DownloadHistory(Base):
 
     @classmethod
     def get_by_path(cls, db: Session, path: str):
+        """保存目录被多次下载复用时，按登记顺序返回最新历史。"""
         return db.execute(
             select(DownloadHistory).where(DownloadHistory.path == path)
+            .order_by(DownloadHistory.id.desc()).limit(1)
         ).scalars().first()
 
     @classmethod
@@ -231,7 +233,6 @@ class DownloadHistory(Base):
         return list(db.execute(
             statement.order_by(DownloadHistory.id.desc())
         ).scalars().all())
-
 
     @classmethod
     def list_by_user_date(cls, db: Session, date: str, username: Optional[str] = None):

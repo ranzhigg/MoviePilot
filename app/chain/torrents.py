@@ -14,6 +14,7 @@ from app.domain.context import Context, MediaInfo, MusicInfo, TorrentInfo
 from app.domain.meta.metabase import MetaBase
 from app.domain.meta.metamusic import MetaMusic
 from app.domain.metainfo import MetaInfo
+from app.foundation.url import UrlUtils
 from app.runtime.log import logger
 from app.runtime.stop import runtime_stop_state
 from app.schemas.media import resolve_media_identity
@@ -318,11 +319,12 @@ class TorrentsChain(ChainBase):
         if not site:
             logger.error(f'站点 {domain} 不存在！')
             return []
-        if not site.get("rss"):
-            logger.error(f'站点 {domain} 未配置RSS地址！')
+        rss_url = UrlUtils.normalize_http_url(site.get("rss"))
+        if rss_url is None:
+            logger.warning(f'站点 {domain} RSS地址无效，跳过获取')
             return []
         # 解析RSS
-        rss_items = RssHelper().parse(site.get("rss"), True if site.get("proxy") else False,
+        rss_items = RssHelper().parse(rss_url, True if site.get("proxy") else False,
                                       timeout=int(site.get("timeout") or 30),
                                       ua=site.get("ua") if site.get("ua") else None)
         if rss_items is None:
@@ -699,13 +701,13 @@ class TorrentsChain(ChainBase):
                     # 发送消息
                     self.post_message(
                         Message(mtype=MessageType.SiteMessage, title=f"站点 {domain} RSS链接已过期",
-                                     link=self.runtime_config.site_url)
+                                link=self.runtime_config.site_url)
                     )
             else:
                 self.post_message(
                     Message(mtype=MessageType.SiteMessage, title=f"站点 {domain} RSS链接已过期",
-                                 link=self.runtime_config.site_url))
+                            link=self.runtime_config.site_url))
         except Exception as e:
             logger.error(f"站点 {domain} RSS链接自动获取失败：{str(e)} - {traceback.format_exc()}")
             self.post_message(Message(mtype=MessageType.SiteMessage, title=f"站点 {domain} RSS链接已过期",
-                                           link=self.runtime_config.site_url))
+                                      link=self.runtime_config.site_url))

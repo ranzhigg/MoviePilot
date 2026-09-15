@@ -5,11 +5,12 @@ from typing import Literal, Optional, Tuple, Union
 from pydantic import GetJsonSchemaHandler
 from pydantic_core import CoreSchema
 
-
 # 音乐实体命名空间由公共类型模块统一持有，避免模型、接口和工具层重复定义。
 MUSIC_ENTITY_RECORDING = "recording"
 MUSIC_ENTITY_ALBUM = "album"
 MUSIC_ENTITY_ARTIST = "artist"
+# 艺术家大合集是下载资源包装分类，不是 MusicBrainz Release Group 类型。
+MUSIC_ARTIST_COLLECTION_CATEGORY = "Artist Collection"
 MusicEntityType = Literal["recording", "album", "artist"]
 MusicTargetEntityType = Literal["recording", "album"]
 MUSIC_ENTITY_TYPES = frozenset({
@@ -28,6 +29,7 @@ class ReplyMode(str, Enum):
 
     DISPATCH = "dispatch"
     CAPTURE_ONLY = "capture_only"
+
 
 # ListenBrainz 音乐探索能力的参数取值域契约，供入口层校验、链层与模块实现共用
 # ListenBrainz 全站统计支持的周期，取值与官方统计页面完全一致
@@ -383,8 +385,11 @@ class SystemConfigKey(Enum):
     UserCustomCSS = "UserCustomCSS"
     # 用户已安装的插件
     UserInstalledPlugins = "UserInstalledPlugins"
-    # 共享源码插件的虚拟运行实例
+    # 共享源码插件的虚拟运行实例（已迁移到独立表，本键保留作回滚依据）
     PluginInstances = "PluginInstances"
+    # 上面那个旧键各条目导入独立表时的内容指纹 {实例ID: 摘要}，据此识别回滚到旧版本
+    # 后新增或改写过的条目，同时避免把用户删掉的分身重新导回
+    PluginInstancesImported = "PluginInstancesImported"
     # 插件文件夹分组配置
     PluginFolders = "PluginFolders"
     # 默认电影订阅规则
@@ -643,8 +648,9 @@ class ModuleType(Enum):
     Other = "other"
 
 
-# 其他杂项模块类型
 class OtherModulesType(Enum):
+    """标识字幕、歌词等不属于专用服务分类的模块。"""
+
     # 字幕
     Subtitle = "站点字幕"
     # Fanart
@@ -663,8 +669,8 @@ class OtherModulesType(Enum):
     ListenBrainz = "ListenBrainz"
     # LRCLIB 歌词
     Lrclib = "LRCLIB"
-    # Musixmatch 授权歌词
-    Musixmatch = "Musixmatch"
+    # AMLL TTML 歌词
+    Amll = "AMLL TTML"
     # AcoustID 音频指纹
     AcoustId = "AcoustID"
 

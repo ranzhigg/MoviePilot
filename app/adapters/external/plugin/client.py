@@ -9,9 +9,10 @@ import threading
 import time
 import traceback
 from collections import Counter
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, cast
-from urllib.parse import urlparse, urlsplit
+from urllib.parse import urlsplit
 
 import httpx2
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -28,6 +29,12 @@ from app.domain.plugin import (
     parse_local_plugin_generation,
     parse_local_plugin_path,
     parse_local_plugin_reference,
+)
+from app.domain.plugin import (
+    normalize_plugin_market_repo_url as _normalize_plugin_market_repo_url,
+)
+from app.domain.plugin import (
+    split_plugin_market_repo_urls as _split_plugin_market_repo_urls,
 )
 from app.foundation.environment import is_free_threaded_runtime
 from app.foundation.singleton import WeakSingleton
@@ -51,6 +58,7 @@ PLUGIN_INDEX_MAX_HISTORY_ENTRIES = 512
 PLUGIN_INDEX_MAX_NESTING = 64
 PLUGIN_INDEX_READ_CHUNK_SIZE = 64 * 1024
 PLUGIN_INDEX_REQUEST_TIMEOUT = 15
+DEFAULT_PLUGIN_INDEX_FETCH_CONCURRENCY = 5
 PLUGIN_INDEX_COMPATIBILITY_FLAG_PATTERN = re.compile(r"^v\d+t?$")
 PLUGIN_INDEX_TEXT_LIMITS = {
     "name": 256,
@@ -63,6 +71,12 @@ PLUGIN_INDEX_TEXT_LIMITS = {
     "homepage": 2048,
     "repo_url": 2048,
 }
+
+# 目录服务和来源库存可能在同一进程内同时刷新；调用方各自创建的信号量
+# 只能限制单次刷新，不能限制真实出站请求总量。索引传输层统一持有闸门。
+_PLUGIN_INDEX_FETCH_GATE = threading.BoundedSemaphore(
+    DEFAULT_PLUGIN_INDEX_FETCH_CONCURRENCY
+)
 
 
 class _PluginIndexTooLargeError(RuntimeError):
@@ -139,34 +153,9 @@ VERSION_BACKWARD_COMPATIBLE_FLAGS: Dict[str, List[str]] = {
     "v3": ["v2"],
 }
 
-def normalize_plugin_market_repo_url(repo_url: str) -> Optional[str]:
-    """规范化插件仓库地址，便于跨来源合并去重。"""
-    repo_url = (repo_url or "").strip().rstrip("/")
-    if not repo_url:
-        return None
-    repo_url = repo_url.removesuffix(".git")
-    parsed_url = urlparse(repo_url)
-    if parsed_url.scheme not in {"http", "https"}:
-        return None
-    if (parsed_url.hostname or "").lower() != "github.com":
-        return None
-    paths = [item for item in parsed_url.path.split("/") if item]
-    if len(paths) < 2:
-        return None
-    return f"https://github.com/{paths[0]}/{paths[1]}"
-
-
-def split_plugin_market_repo_urls(value: Optional[str]) -> list[str]:
-    """拆分插件市场仓库配置并保持原有顺序去重。"""
-    repos: list[str] = []
-    seen_repos = set()
-    for item in re.split(r"[\n,，]+", value or ""):
-        normalized_repo = normalize_plugin_market_repo_url(item)
-        if not normalized_repo or normalized_repo.lower() in seen_repos:
-            continue
-        repos.append(normalized_repo)
-        seen_repos.add(normalized_repo.lower())
-    return repos
+# 保留历史兼容模块的导出路径；规范化规则的唯一实现位于纯领域模块。
+normalize_plugin_market_repo_url = _normalize_plugin_market_repo_url
+split_plugin_market_repo_urls = _split_plugin_market_repo_urls
 
 
 def extract_plugin_market_repos_from_wiki(
@@ -216,10 +205,18 @@ def merge_plugin_market_repos(
         seen_repos.add(normalized_repo.lower())
     return merged_repos
 
+
 class PluginMarketTransport(metaclass=WeakSingleton):
     """负责插件市场、本地仓库和 GitHub 元数据读取。"""
 
     _base_url = "https://raw.githubusercontent.com/{user}/{repo}/main/"
+    _index_future_lock = threading.Lock()
+    _index_futures: dict[tuple[str, str], Future[Optional[PluginIndex]]] = {}
+    _index_task_lock = threading.Lock()
+    _index_tasks: dict[
+        tuple[asyncio.AbstractEventLoop, str, str],
+        asyncio.Task[Optional[PluginIndex]],
+    ] = {}
     _release_task_lock = threading.Lock()
     _release_tasks: dict[
         tuple[asyncio.AbstractEventLoop, str, bool],
@@ -494,13 +491,12 @@ class PluginMarketTransport(metaclass=WeakSingleton):
         candidates: PluginIndex = {}
         for repo_order, repo_path in enumerate(self.get_local_repo_paths()):
             if not repo_path.exists() or not repo_path.is_dir():
-                logger.warn(f"本地插件仓库目录不存在或不可读：{repo_path}")
-                continue
+                raise RuntimeError(f"本地插件仓库目录不存在或不可读：{repo_path}")
 
             package_candidates = []
             if get_runtime_setting('VERSION_FLAG'):
                 package_candidates.append((get_runtime_setting('VERSION_FLAG'), self.__get_local_package(repo_path,
-                                                                                           get_runtime_setting('VERSION_FLAG'))))
+                                                                                                         get_runtime_setting('VERSION_FLAG'))))
                 # 向后兼容：补充扫描更低版本的 package 文件，便于本地仓库复用历史版本插件。
                 for backward_flag in VERSION_BACKWARD_COMPATIBLE_FLAGS.get(get_runtime_setting('VERSION_FLAG'), []):
                     package_candidates.append((backward_flag, self.__get_local_package(repo_path, backward_flag)))
@@ -891,6 +887,8 @@ class PluginMarketTransport(metaclass=WeakSingleton):
         if not repo_url:
             return None
 
+        repo_url = normalize_plugin_market_repo_url(repo_url) or repo_url
+
         user, repo = cls.get_repo_info(repo_url)
         if not user or not repo:
             return None
@@ -1137,6 +1135,81 @@ class PluginMarketTransport(metaclass=WeakSingleton):
         releases.extend(cls.__normalize_plugin_release_response(payload))
         return len(payload) >= 100
 
+    @staticmethod
+    def _plugin_index_key(
+        repo_url: str,
+        package_version: Optional[str],
+    ) -> tuple[str, str]:
+        """生成跨 URL 表示形式稳定的插件索引请求键。"""
+        normalized_repo = normalize_plugin_market_repo_url(repo_url)
+        return (
+            (normalized_repo or str(repo_url).strip().rstrip("/")).lower(),
+            package_version or "",
+        )
+
+    @classmethod
+    def _remove_index_future(
+        cls,
+        key: tuple[str, str],
+        future: Future[Optional[PluginIndex]],
+    ) -> None:
+        """同步索引请求结束后释放 single-flight 占位。"""
+        with cls._index_future_lock:
+            if cls._index_futures.get(key) is future:
+                cls._index_futures.pop(key, None)
+
+    @classmethod
+    def _remove_index_task(
+        cls,
+        key: tuple[asyncio.AbstractEventLoop, str, str],
+        task: asyncio.Future[Optional[PluginIndex]],
+    ) -> None:
+        """异步索引请求结束后释放事件循环和仓库引用。"""
+        with cls._index_task_lock:
+            if cls._index_tasks.get(key) is task:
+                cls._index_tasks.pop(key, None)
+        # 调用方可能在请求完成前取消等待；主动读取异常避免事件循环告警，
+        # 不影响其他仍在等待同一个任务的调用方取得原始异常。
+        try:
+            task.exception()
+        except BaseException:  # noqa: BLE001 - 仅消费已完成任务的异常
+            pass
+
+    @staticmethod
+    async def _acquire_index_fetch_slot() -> None:
+        """以可取消方式等待跨同步/异步调用共享的索引请求闸门。"""
+        while not _PLUGIN_INDEX_FETCH_GATE.acquire(blocking=False):
+            await asyncio.sleep(0.01)
+
+    def _fetch_plugin_index_sync(
+        self,
+        package_url: str,
+        headers: Optional[dict[str, str]],
+    ) -> Optional[PluginIndex]:
+        """在共享进程级闸门内完成一次同步索引读取。"""
+        with _PLUGIN_INDEX_FETCH_GATE:
+            response = self.__request_plugin_index_with_fallback(
+                package_url,
+                headers=headers,
+            )
+        return self._resolve_plugin_index_result(response)
+
+    async def _fetch_plugin_index_async(
+        self,
+        package_url: str,
+        headers: Optional[dict[str, str]],
+    ) -> Optional[PluginIndex]:
+        """在共享进程级闸门内完成一次异步索引读取。"""
+        await self._acquire_index_fetch_slot()
+        try:
+            response = await self.__async_request_plugin_index_with_fallback(
+                package_url,
+                headers=headers,
+            )
+        finally:
+            _PLUGIN_INDEX_FETCH_GATE.release()
+        return self._resolve_plugin_index_result(response)
+
     @cached(maxsize=1024, ttl=1800, skip_none=False)  # type: ignore[misc]
     def get_plugin_index_result(
             self,
@@ -1148,11 +1221,32 @@ class PluginMarketTransport(metaclass=WeakSingleton):
         if request is None:
             raise ValueError("插件仓库地址无效")
         package_url, headers = request
-        response = self.__request_plugin_index_with_fallback(
-            package_url,
-            headers=headers,
-        )
-        return self._resolve_plugin_index_result(response)
+        key = self._plugin_index_key(repo_url, package_version)
+        with self._index_future_lock:
+            future = self._index_futures.get(key)
+            if future is None:
+                future = Future[Optional[PluginIndex]]()
+                self._index_futures[key] = future
+                owner = True
+            else:
+                owner = False
+
+        assert future is not None
+
+        if not owner:
+            return future.result()
+
+        try:
+            result = self._fetch_plugin_index_sync(package_url, headers)
+        except BaseException as error:  # noqa: BLE001 - 共享结果必须传播原始异常
+            future.set_exception(error)
+            future.exception()
+            raise
+        else:
+            future.set_result(result)
+            return result
+        finally:
+            self._remove_index_future(key, future)
 
     def get_plugins(self, repo_url: str,
                     package_version: Optional[str] = None) -> Optional[PluginIndex]:
@@ -1486,11 +1580,33 @@ class PluginMarketTransport(metaclass=WeakSingleton):
         if request is None:
             raise ValueError("插件仓库地址无效")
         package_url, headers = request
-        response = await self.__async_request_plugin_index_with_fallback(
-            package_url,
-            headers=headers,
+        repo_key, generation_key = self._plugin_index_key(
+            repo_url,
+            package_version,
         )
-        return self._resolve_plugin_index_result(response)
+        loop = asyncio.get_running_loop()
+        task_key = (loop, repo_key, generation_key)
+        with self._index_task_lock:
+            task = self._index_tasks.get(task_key)
+            if task is None:
+                task = cast(
+                    asyncio.Task[Optional[PluginIndex]],
+                    get_task_registry().create(
+                        self._fetch_plugin_index_async(package_url, headers),
+                        owner="plugin.market.index",
+                    ),
+                )
+                self._index_tasks[task_key] = task
+
+                def on_index_task_done(
+                    completed_task: asyncio.Future[Optional[PluginIndex]],
+                ) -> None:
+                    self._remove_index_task(task_key, completed_task)
+
+                task.add_done_callback(on_index_task_done)
+
+        # 单个调用方取消等待时不能连带取消共享请求。
+        return await asyncio.shield(task)
 
     async def async_get_plugins(self, repo_url: str,
                                 package_version: Optional[str] = None) -> Optional[PluginIndex]:

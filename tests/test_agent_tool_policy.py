@@ -243,6 +243,23 @@ def test_system_settings_secret_read_query_cannot_bypass_confirmation() -> None:
     assert policy.result_sensitivity is ResultSensitivity.SECRET
 
 
+def test_system_settings_describe_secret_read_has_the_same_confirmation_boundary() -> None:
+    """新的精确设置读取入口不能绕过旧入口的明文敏感值确认。"""
+    policy = DEFAULT_TOOL_POLICY_REGISTRY.resolve(
+        tool_name="moviepilot_api",
+        arguments={
+            "operation_id": "config.system.describe",
+            "query": {"show_secrets": True},
+        },
+        requires_admin=True,
+    )
+
+    assert policy.effect is ActionEffect.SENSITIVE_READ
+    assert policy.required_role is PrincipalRole.SYSTEM_ADMIN
+    assert policy.confirmation is ConfirmationMode.REQUIRED
+    assert policy.result_sensitivity is ResultSensitivity.SECRET
+
+
 def test_legacy_shadow_decision_allows_without_claiming_enforcement() -> None:
     """shadow 决策只能观测，不能拒绝或要求确认。"""
     context = _interactive_context()
@@ -445,7 +462,7 @@ def test_middleware_observation_failure_does_not_replace_success(
 
 
 def test_middleware_fail_observation_does_not_mask_tool_error() -> None:
-    """shadow fail hook 故障后仍必须抛出原始工具异常。"""
+    """shadow fail hook 故障后仍返回真实工具故障，模型可以继续处理。"""
     orchestrator = MagicMock()
     orchestrator.start.return_value = SimpleNamespace(decision=SimpleNamespace(allowed=True))
     orchestrator.fail.side_effect = RuntimeError("policy-fail-hook-failure")
@@ -462,10 +479,12 @@ def test_middleware_fail_observation_does_not_mask_tool_error() -> None:
     async def _handler(_request):
         raise tool_error
 
-    with pytest.raises(ValueError) as error_info:
-        asyncio.run(middleware.awrap_tool_call(request, _handler))
+    result = asyncio.run(middleware.awrap_tool_call(request, _handler))
 
-    assert error_info.value is tool_error
+    assert result.status == "error"
+    assert "ValueError" in result.content
+    assert "original-tool-failure" not in result.content
+    assert "policy-fail-hook-failure" not in result.content
 
 
 def test_middleware_keeps_shadow_observation_without_enforcing_decision() -> None:
@@ -630,7 +649,12 @@ def test_agent_admin_dynamic_tool_keeps_existing_authorization_authority(
     ):
         result = asyncio.run(middleware.awrap_tool_call(request, _handler))
 
-    assert result.content == expected_result
+    if legacy_admin:
+        assert result.content == expected_result
+        assert result.status == "success"
+    else:
+        assert json.loads(result.content) == {"success": False, "error": expected_result}
+        assert result.status == "error"
     assert events.count("run") == expected_run_count
     assert len(observations) == 1
     assert observations[0].policy.effect is ActionEffect.UNKNOWN
@@ -657,7 +681,11 @@ def test_direct_non_admin_safe_read_rejects_before_policy_or_schema() -> None:
 
     result = json.loads(asyncio.run(manager.call_tool(tool.name, {"query": "same"})))
 
-    assert result == {"error": "抱歉，您没有执行此工具的权限。只有系统管理员才能执行工具操作。"}
+    assert result == {
+        "error": "抱歉，您没有执行此工具的权限。只有系统管理员才能执行工具操作。",
+        "execution_outcome": "failed",
+        "recovery": "当前身份无权执行该工具；改用允许的只读工具或请求具备权限的用户确认。",
+    }
     assert events == []
     orchestrator.start.assert_not_called()
 

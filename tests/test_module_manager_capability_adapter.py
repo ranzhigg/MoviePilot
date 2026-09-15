@@ -16,10 +16,11 @@ import pytest
 from app.db.oper.systemconfig import SystemConfigOper
 from app.foundation.singleton import Singleton
 from app.runtime.capabilities.errors import CapabilityRuntimeClosedError
-from app.runtime.capabilities.model import CapabilityLifecycleState, SelectorSchema
+from app.runtime.capabilities.model import ActivationPolicy, CapabilityLifecycleState, SelectorSchema
 from app.runtime.capabilities.registry import CapabilityRegistry
 from app.runtime.events import Event, EventHandlerBinding, eventmanager
 from app.runtime.extensions.module import manager as module_manager_extension
+from app.runtime.extensions.module.adapter import HostModuleConfigSnapshot, should_run_host_module
 from app.runtime.extensions.module.manager import ModuleManager
 from app.runtime.extensions.service import configure_service_config_reader
 from app.schemas.event import ConfigChangeEventData
@@ -351,6 +352,36 @@ def test_specs_are_lightweight_and_do_not_materialize_modules(
     assert manager.get_running_module("SampleModule") is None
 
 
+def test_list_enabled_specs_only_exposes_selector_enabled_modules(
+    module_manager_harness,
+) -> None:
+    """健康检查模块目录只应包含当前 selector 判定为启用的声明。"""
+    manager = module_manager_harness.manager
+
+    assert manager.list_enabled_specs() == ()
+
+    _enable_sample(module_manager_harness.config_values)
+
+    assert [spec.id for spec in manager.list_enabled_specs()] == ["SampleModule"]
+
+
+def test_bootstrap_module_switch_defaults_on_and_honors_explicit_disable() -> None:
+    """统一模块开关默认开启，显式 false 才会停止 Bootstrap 模块。"""
+    spec = SimpleNamespace(id="BootstrapModule", activation=ActivationPolicy.BOOTSTRAP)
+    enabled_snapshot = HostModuleConfigSnapshot(settings={}, services={})
+    disabled_snapshot = HostModuleConfigSnapshot(
+        settings={"MODULE_ENABLE": {"BootstrapModule": False}},
+        services={},
+    )
+
+    assert should_run_host_module(spec, enabled_snapshot) is True
+    assert should_run_host_module(spec, disabled_snapshot) is False
+
+    for module_id in ("FileManagerModule", "MusicBrainzModule", "SubtitleModule"):
+        protected_spec = SimpleNamespace(id=module_id, activation=ActivationPolicy.BOOTSTRAP)
+        assert should_run_host_module(protected_spec, disabled_snapshot) is True
+
+
 def test_get_module_materializes_one_canonical_class_without_starting_it(
     module_manager_harness,
 ) -> None:
@@ -590,7 +621,9 @@ lifecycle_events = []
 instances = {}
 
 def make_recorder(operation, capability_id):
+    '''为每个模块保存独立的生命周期调用记录。'''
     def record(instance):
+        '''记录生命周期操作与实际模块实例身份。'''
         lifecycle_events.append((operation, capability_id, id(instance)))
     return record
 
@@ -637,7 +670,9 @@ events = {spec.id: [] for spec in specs}
 adapter = HostModuleAdapter()
 
 def make_recorder(operation, capability_id):
+    '''构造按模块身份分类的生命周期记录器。'''
     def record(instance):
+        '''保存当前操作及实例身份以验证重载复用。'''
         events[capability_id].append((operation, id(instance)))
     return record
 
@@ -672,6 +707,7 @@ for spec in specs:
 config_values.update({key: list(value) for key, value in enabled_service_values.items()})
 
 def get_config(_self, key=None):
+    '''将真实模块配置查询限制到用例构造的内存配置。'''
     key_value = getattr(key, "value", key)
     if key_value is None:
         return dict(config_values)
@@ -881,11 +917,13 @@ from app.db.oper.systemconfig import SystemConfigOper
 from app.runtime.config import settings
 
 def empty_config(self, key=None):
+    '''以空配置验证未启用模块不会加载外部服务实现。'''
     return {} if key is None else []
 
 SystemConfigOper.get = empty_config
 settings.ACOUSTID_API_KEY = None
 settings.FANART_API_KEY = None
+settings.FANART_ENABLE = False
 
 from app.runtime.extensions.module.manager import ModuleManager
 from app.application.module import configure_module_runtime
@@ -896,9 +934,21 @@ manager = ModuleManager()
 assert len(manager.list_specs()) == 41
 assert manager.get_specs() == manager.list_specs()
 
-from app.api.endpoints.system import modulelist
+from app.api.endpoints.module import modulelist
 response = modulelist(None)
-assert len(response.data["modules"]) == 41
+assert len(response.data["modules"]) == 17
+
+switchable_ids = {spec.id for spec in manager.list_switchable_specs()}
+assert {
+    "FileManagerModule",
+    "FilterModule",
+    "IndexerModule",
+    "MusicBrainzModule",
+    "PostgreSQLModule",
+    "RedisModule",
+    "SubtitleModule",
+    "TheMovieDbModule",
+}.isdisjoint(switchable_ids)
 
 heavy_prefixes = (
     "lark_oapi",
@@ -1002,6 +1052,7 @@ SystemConfigOper.get = lambda self, key=None: {} if key is None else []
 from app.runtime.config import settings
 settings.ACOUSTID_API_KEY = None
 settings.FANART_API_KEY = None
+settings.FANART_ENABLE = False
 
 from app.runtime.extensions.module.manager import ModuleManager
 

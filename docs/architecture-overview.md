@@ -583,6 +583,8 @@ flowchart LR
 
 ## 七、AI Agent 子系统
 
+复杂任务的计划、工具发现和中断恢复使用说明见 [Agent 复杂任务执行与恢复](agent.md)。
+
 Agent 采用**门面 + 惰性物化**设计，避免 `application → agent` 形成静态依赖边：
 
 ```mermaid
@@ -665,7 +667,11 @@ flowchart TB
   `app/api/` 的宿主端点。插件若已经自行返回 `Response`、字典、列表或其它可序列化值，宿主不再二次包裹。
 - `app/runtime/extensions/plugin/manager.py` 是 canonical 管理器 owner，发现、加载、生命周期、
   目录、同步等实现共同归入 `app/runtime/extensions/plugin/`。旧插件仍从 `app.core.plugin` 或
-  `app.sdk.plugins` 进入，并由 Compat 精确路由到同一个 `PluginManager` 身份。
+  `app.sdk.plugins` 进入，并由 Compat 精确路由到同一个 `PluginManager` 身份；新入口是
+  `app.sdk.plugin.manager`。
+- `app/sdk/plugin/base.py` 是插件契约基类 `_PluginBase` 与 `PluginChain` 的 owner。
+  `app/plugins/` 只是插件安装命名空间，包根不再导出符号，`app.plugins._PluginBase` 与历史拼写
+  `app.plugins.PluginChian` 由 Compat 精确叠加承接。
 - 插件可参与 `run_module` 方法分发（同名方法优先响应）并注册事件处理器。
 
 ---
@@ -747,15 +753,15 @@ flowchart LR
   SDK 导出（若公开）、`docs/rules/05-architecture.md` 与上述架构测试。
 - 延迟导入不被接受为隐藏循环依赖的手段。
 
-### 10.1 2026-09-03 当前收口状态与后续边界
+### 10.1 2026-09-11 当前收口状态与后续边界
 
 当前宿主架构基线（排除 `app/plugins/**`）如下；数字来自
 `tests/fixtures/architecture/`，更新基线前必须先审查语义变化：
 
 | 指标 | 当前值 |
 |---|---:|
-| Python 模块 | 981 |
-| 内部导入边 | 8,315 |
+| Python 模块 | 1025 |
+| 内部导入边 | 8,733 |
 | 非平凡 SCC | 1（精确 containment 的 TMDB 移植包环） |
 | Application / Chain 具体 Adapter 直连 | 0 / 0 |
 | Direct egress | 53（债务已清零，53 条精确 containment） |
@@ -764,6 +770,8 @@ flowchart LR
 | Event producer / consumer | 86（85 静态、1 动态）/ 17（16 静态、1 动态） |
 | Model/Oper 自动事务与自建 Session | 0 |
 | 组合根外 `SystemConfigOper()` | 0 |
+
+整理失败反馈由 `app.application.transfer.feedback` 集中投影；Agent 持久回执新增 Application 端口及 DB Model/Oper/Adapter 四个冷导入模块。当前 `app.startup.lifecycle` 为 553、`app.factory` 为 565、`app.main` 为 567。性能基线只同步模块数量，原有耗时预算、历史采样和生命周期资源约束保持有效。
 
 架构专项验证分为两个 CI 投影：`Check event semantic policy` 先运行依赖、Adapter、出口和 Event
 语义门禁，`Check host architecture snapshot` 再执行快照测试及一次
@@ -798,7 +806,7 @@ flowchart LR
   保留多余导出。
 
 当前架构问题、优先级、分阶段实施步骤与验收门禁见
-[`docs/architecture/optimization-checklist.md`](architecture/optimization-checklist.md)。
+[`docs/refactor/optimization-checklist.md`](refactor/optimization-checklist.md)。
 
 ---
 
@@ -814,7 +822,7 @@ flowchart LR
 | [`docs/rules/10-data-and-persistent.md`](rules/10-data-and-persistent.md) | 数据模型、迁移与缓存规范 |
 | [`docs/subscribe-lifecycle.md`](subscribe-lifecycle.md) | 订阅生命周期详解 |
 | [`docs/mcp-api.md`](mcp-api.md) | MCP 工具端点说明 |
-| [`docs/architecture/optimization-checklist.md`](architecture/optimization-checklist.md) | 当前架构差距、优先级与可执行优化清单 |
-| [`docs/architecture/refactor-roadmap.md`](architecture/refactor-roadmap.md) | 多级 Goal、叶子依赖、清零条件与交付状态 |
+| [`docs/refactor/optimization-checklist.md`](refactor/optimization-checklist.md) | 当前架构差距、优先级与可执行优化清单 |
+| [`docs/refactor/refactor-roadmap.md`](refactor/refactor-roadmap.md) | 多级 Goal、叶子依赖、清零条件与交付状态 |
 | [`docs/v3t-runtime-governance.md`](v3t-runtime-governance.md) | V3/V3t 运行依赖、故障恢复、GIL 可观测性与兼容退场门禁 |
 | [`docs/adr/0007-background-action-reliability.md`](adr/0007-background-action-reliability.md) | 后台动作 E0–E3 可靠性分级与完成语义决策 |

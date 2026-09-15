@@ -30,7 +30,6 @@ from app.schemas.types import (
 class DownloadHistoryOwner(_DownloadOwnerBase):
     """下载历史原子写入与持久化结算 owner。"""
 
-
     @staticmethod
     def _build_download_note(
             source: Optional[str],
@@ -113,9 +112,11 @@ class DownloadHistoryOwner(_DownloadOwnerBase):
             custom_words=custom_words,
         )
         files_to_add: list[DownloadFileWrite] = []
+        custom_word_list = custom_words.splitlines() if custom_words else []
         for file in file_list:
             if episodes:
-                file_meta = MetaInfo(Path(file).stem)
+                # 与订阅选集使用相同识别词，避免偏移前的文件集数被目标集数过滤。
+                file_meta = MetaInfo(Path(file).stem, custom_words=custom_word_list)
                 if not file_meta.begin_episode or file_meta.begin_episode not in episodes:
                     continue
             if not Path(file).suffix or Path(file).suffix.lower() not in self.runtime_config.media_extensions:
