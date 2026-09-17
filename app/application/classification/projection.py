@@ -11,12 +11,13 @@ from app.application.classification.migration import (
     _EXTENSION_PREFIX,
     _MEDIA_KEYS,
     _SAFE_FIELD_SEGMENT,
-    _TMDB_GENRE_KEYS,
     _TMDB_SOURCE,
     LegacyClassificationDiagnostic,
     LegacyDiagnosticPathPart,
     LegacyMediaKey,
 )
+from app.domain.classification.conditions import condition_field_ids
+from app.domain.classification.vocabulary import TMDB_GENRE_KEYS
 from app.schemas.category import (
     CategoryConfig,
     CategoryRule,
@@ -25,12 +26,11 @@ from app.schemas.category import (
     ClassificationFactScalar,
     ClassificationFactValue,
     ClassificationFieldDefinition,
-    ClassificationMediaType,
     ClassificationPolicy,
     ClassificationRule,
 )
 
-_TMDB_GENRE_IDS: Final[dict[str, str]] = {value: key for key, value in _TMDB_GENRE_KEYS.items()}
+_TMDB_GENRE_IDS: Final[dict[str, str]] = {value: key for key, value in TMDB_GENRE_KEYS.items()}
 
 LegacyPolicyOrFields: TypeAlias = ClassificationPolicy | Iterable[ClassificationFieldDefinition]
 """受控 TMDB 扩展事实可以从策略或字段声明中发现。"""
@@ -55,13 +55,12 @@ def project_policy_to_legacy_category_projection(
     """
     把新版策略尽可能投影为旧 CategoryConfig
 
-    本迁移器生成的分类、规则和来源兜底可精确恢复；新版独有结构会保留可表达部分并返回警告。
+    本迁移器生成的分类、规则和全局兜底可精确恢复；新版独有结构会保留可表达部分并返回警告。
 
     :param policy: 待兼容投影的新版策略
     :return: 旧配置和无法精确表达的结构化诊断
     """
     diagnostics: list[LegacyClassificationDiagnostic] = []
-    source_fallbacks = _policy_source_fallbacks(policy)
     rules_by_category = _category_rules(policy)
     projected: dict[LegacyMediaKey, dict[str, Optional[CategoryRule]]] = {
         "movie": {},
@@ -73,7 +72,7 @@ def project_policy_to_legacy_category_projection(
         if media_key is None or not category.id.startswith(f"legacy.{media_key}."):
             continue
         category_path: list[LegacyDiagnosticPathPart] = ["categories", category_index]
-        if source_fallbacks.get(_TMDB_SOURCE, {}).get(category.media_type) == category.id:
+        if policy.fallbacks.get(category.media_type) == category.id:
             rule = rules_by_category.get(category.id)
             if rule is not None and rule.id.endswith(".fallback"):
                 projected[media_key][category.name] = CategoryRule.model_validate(_project_fallback_metadata(rule))
@@ -158,20 +157,12 @@ def resolve_legacy_tmdb_category(
     return _resolve_legacy_category_mapping(categories, tmdb_info)
 
 
-def _policy_source_fallbacks(
-    policy: ClassificationPolicy,
-) -> Mapping[str, Mapping[ClassificationMediaType, str]]:
-    """读取新版来源专属兜底映射，并兼容并行 schema 合入前的空状态。"""
-    value = getattr(policy, "source_fallbacks", {})
-    return value if isinstance(value, Mapping) else {}
-
-
 def _category_rules(policy: ClassificationPolicy) -> dict[str, ClassificationRule]:
-    """按目标分类 ID 索引 TMDB 主分类规则，保持首条规则优先。"""
+    """按迁移分类目标 ID 索引主分类规则，保持首条规则优先。"""
     result: dict[str, ClassificationRule] = {}
     for rule in policy.rules:
         category_id = rule.target.category_id or _archived_category_id(rule)
-        if category_id and _TMDB_SOURCE in rule.sources:
+        if category_id and category_id.startswith("legacy."):
             result.setdefault(category_id, rule)
     return result
 
@@ -221,6 +212,7 @@ def _project_rule(
             policy,
             diagnostics,
             rule.id,
+            media_type=rule.media_types[0] if rule.media_types else None,
         )
         if field_name is None:
             continue
@@ -229,11 +221,11 @@ def _project_rule(
             continue
         if not values:
             continue
-        token = _render_legacy_token(values)
-        rendered = f"!{token}" if negative else token
         field_tokens = tokens_by_field.setdefault(field_name, [])
-        if rendered not in field_tokens:
-            field_tokens.append(rendered)
+        for value in values:
+            rendered = f"!{value}" if negative else value
+            if rendered not in field_tokens:
+                field_tokens.append(rendered)
     return (
         {field_name: ",".join(tokens) for field_name, tokens in tokens_by_field.items()},
         diagnostics,
@@ -260,9 +252,19 @@ def _project_condition(
     policy: ClassificationPolicy,
     diagnostics: list[LegacyClassificationDiagnostic],
     rule_id: str,
+    *,
+    media_type: Optional[str],
 ) -> tuple[Optional[str], list[str], bool]:
     """把一个迁移器叶子恢复为旧字段、值集合和排除标志。"""
-    if condition.operator not in {"contains_any", "contains_none", "exists"}:
+    if condition.operator not in {
+        "contains_any",
+        "contains_none",
+        "exists",
+        "in",
+        "not_in",
+        "is_true",
+        "is_false",
+    }:
         diagnostics.append(
             _projection_warning(
                 "unsupported_policy_condition",
@@ -287,6 +289,72 @@ def _project_condition(
                 continue
             projected_values.append(genre_id)
         return "genre_ids", projected_values, condition.operator == "contains_none"
+    if condition.field == "media.language":
+        if condition.operator not in {"in", "not_in"}:
+            diagnostics.append(
+                _projection_warning(
+                    "unsupported_policy_condition",
+                    f"规则 {rule_id} 的语言操作符 {condition.operator} 无法投影到旧配置",
+                    ["rules", rule_id, "when"],
+                )
+            )
+            return None, [], False
+        aliases = policy.field_aliases.get(condition.field, {})
+        return (
+            "original_language",
+            [_original_standard_value(value, aliases) for value in values],
+            condition.operator == "not_in",
+        )
+    if condition.field == "media.countries":
+        if condition.operator not in {"contains_any", "contains_none"}:
+            diagnostics.append(
+                _projection_warning(
+                    "unsupported_policy_condition",
+                    f"规则 {rule_id} 的国家操作符 {condition.operator} 无法投影到旧配置",
+                    ["rules", rule_id, "when"],
+                )
+            )
+            return None, [], False
+        field_name = "production_countries" if media_type == "电影" else "origin_country"
+        aliases = policy.field_aliases.get(condition.field, {})
+        return (
+            field_name,
+            [_original_standard_value(value, aliases) for value in values],
+            condition.operator == "contains_none",
+        )
+    if condition.field == "media.year":
+        if condition.operator not in {"in", "not_in"}:
+            diagnostics.append(
+                _projection_warning(
+                    "unsupported_policy_condition",
+                    f"规则 {rule_id} 的年份操作符 {condition.operator} 无法投影到旧配置",
+                    ["rules", rule_id, "when"],
+                )
+            )
+            return None, [], False
+        return "release_year", values, condition.operator == "not_in"
+    if condition.field == "media.runtime":
+        if condition.operator not in {"in", "not_in"}:
+            diagnostics.append(
+                _projection_warning(
+                    "unsupported_policy_condition",
+                    f"规则 {rule_id} 的片长操作符 {condition.operator} 无法投影到旧配置",
+                    ["rules", rule_id, "when"],
+                )
+            )
+            return None, [], False
+        return "runtime", values, condition.operator == "not_in"
+    if condition.field == "media.adult":
+        if condition.operator not in {"is_true", "is_false"}:
+            diagnostics.append(
+                _projection_warning(
+                    "unsupported_policy_condition",
+                    f"规则 {rule_id} 的成人标记操作符 {condition.operator} 无法投影到旧配置",
+                    ["rules", rule_id, "when"],
+                )
+            )
+            return None, [], False
+        return "adult", ["TRUE" if condition.operator == "is_true" else "FALSE"], False
     if condition.field.startswith(_EXTENSION_PREFIX):
         field_name = condition.field.removeprefix(_EXTENSION_PREFIX)
         aliases = policy.field_aliases.get(condition.field, {})
@@ -310,15 +378,12 @@ def _original_alias_value(value: str, aliases: Mapping[str, str]) -> str:
     return value
 
 
-def _render_legacy_token(values: Sequence[str]) -> str:
-    """把一个迁移时保留边界的值集合恢复为单个旧逗号项。"""
-    if len(values) == 1:
-        return values[0]
-    if values and all(value.isdigit() for value in values):
-        numbers = [int(value) for value in values]
-        if numbers == list(range(numbers[0], numbers[-1] + 1)):
-            return f"{numbers[0]}-{numbers[-1]}"
-    return "-".join(values)
+def _original_standard_value(value: str, aliases: Mapping[str, str]) -> str:
+    """恢复标准字段迁移前的低位写法，不把生成的标题大小写别名写回旧配置。"""
+    for alias, canonical in aliases.items():
+        if canonical == value and alias == alias.casefold() and alias != value:
+            return alias
+    return value
 
 
 def _projection_warning(
@@ -409,7 +474,7 @@ def _controlled_tmdb_fields(
     field_ids: list[str] = []
     if isinstance(policy_or_field_defs, ClassificationPolicy):
         for rule in policy_or_field_defs.rules:
-            field_ids.extend(_condition_field_ids(rule.when))
+            field_ids.extend(condition_field_ids(rule.when))
     else:
         for definition in policy_or_field_defs:
             if definition.source_support.get(_TMDB_SOURCE) == "extension":
@@ -423,21 +488,6 @@ def _controlled_tmdb_fields(
         if _SAFE_FIELD_SEGMENT.fullmatch(field_name):
             _append_unique(fields, field_name)
     return tuple(fields)
-
-
-def _condition_field_ids(node: ClassificationConditionNode) -> list[str]:
-    """按条件树顺序提取全部叶子字段 ID。"""
-    if isinstance(node, ClassificationCondition):
-        return [node.field]
-    if node.all is not None:
-        children = node.all
-    elif node.any is not None:
-        children = node.any
-    elif node.not_ is not None:
-        children = [node.not_]
-    else:
-        children = []
-    return [field_id for child in children for field_id in _condition_field_ids(child)]
 
 
 def _project_legacy_tmdb_field(

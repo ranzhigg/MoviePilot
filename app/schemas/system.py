@@ -190,12 +190,31 @@ class SystemSettingsUpdateRequest(BaseModel):  # type: ignore[misc]
         default=None,
         description="Value compared against match_field. If omitted, use value[match_field]; scalar lists use value directly.",
     )
+    expected_revision: Optional[str] = Field(
+        description=(
+            "Optional revision returned by config.system.describe or config.system.get for this exact setting. "
+            "When supplied, the update is rejected if another writer changed the setting after that read. "
+            "New Agent clients should always provide it."
+        ),
+        default=None,
+        min_length=1,
+        max_length=128,
+    )
 
 
 class CustomIdentifiersUpdateRequest(BaseModel):  # type: ignore[misc]
     """完整替换自定义识别词的请求。"""
 
-    identifiers: list[str] = Field(default_factory=list)
+    identifiers: list[str] = Field(
+        default_factory=list,
+        description="Complete ordered list of custom recognition identifier rules.",
+    )
+    expected_identifiers: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "Previously read complete ordered list. When supplied, reject the replacement if the stored list has changed."
+        ),
+    )
 
 
 SystemUpdateType = Literal["application", "resources"]
@@ -243,6 +262,9 @@ class SystemUpdateRequest(BaseModel):  # type: ignore[misc]
 
 class SystemUpdateStatus(BaseModel):
     """主程序与站点资源后台更新的聚合状态快照。"""
+
+    auto_update: bool = Field(default=False, description="是否启用主程序自动检查及升级提醒")
+    auto_update_resource: bool = Field(default=True, description="是否启用站点资源自动检查及升级提醒")
 
     state: Literal[
         "idle",
@@ -302,7 +324,7 @@ class NetTestTarget(BaseModel):
 
 
 class SystemModuleInfo(BaseModel):
-    """已加载系统模块摘要。"""
+    """当前配置下已启用系统模块摘要。"""
 
     id: str
     name: str
@@ -311,9 +333,49 @@ class SystemModuleInfo(BaseModel):
 
 
 class SystemModuleListData(BaseModel):
-    """已加载系统模块列表。"""
+    """当前配置下已启用系统模块列表。"""
 
     modules: list[SystemModuleInfo] = Field(default_factory=list)
+
+
+class SystemModuleSettingInfo(BaseModel):  # type: ignore[misc]
+    """可由用户统一开关的内置模块设置摘要。"""
+
+    id: str
+    name: str
+    name_i18n: str
+    name_key: str
+    description_i18n: str
+    description_key: str
+    enabled: bool
+
+
+class SystemModuleSettingListData(BaseModel):  # type: ignore[misc]
+    """可由用户统一开关的内置模块设置列表。"""
+
+    modules: list[SystemModuleSettingInfo] = Field(default_factory=list)
+
+
+class SystemModuleCatalogInfo(BaseModel):  # type: ignore[misc]
+    """前端服务选择器可消费的宿主模块目录项。"""
+
+    id: str
+    name: str
+    name_i18n: str
+    name_key: str
+    description_i18n: str
+    description_key: str
+    type: str
+    subtype: str
+    option_value: Optional[str] = None
+    enabled: bool = True
+    active: bool = False
+
+
+class SystemModuleCatalogListData(BaseModel):  # type: ignore[misc]
+    """宿主模块及其服务类型目录。"""
+
+    modules: list[SystemModuleCatalogInfo] = Field(default_factory=list)
 
 
 class DatabaseBackupArtifactData(BaseModel):  # type: ignore[misc]

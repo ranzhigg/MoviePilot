@@ -21,10 +21,13 @@ _SUBSCRIPTION_FIELDS = frozenset(
         "year",
         "type",
         "keyword",
+        "search_interval",
+        "last_search",
         "media_source",
         "media_id",
         "music_type",
         "total_tracks",
+        "downloaded_tracks",
         "season",
         "poster",
         "backdrop",
@@ -81,8 +84,10 @@ _CLASSIFICATION_HISTORY_FIELDS = frozenset(
 _SUBSCRIPTION_HISTORY_FIELDS = (_SUBSCRIPTION_FIELDS - {
     "lack_episode",
     "note",
+    "downloaded_tracks",
     "state",
     "last_update",
+    "last_search",
     "downloader",
     "manual_total_episode",
 }) | _CLASSIFICATION_HISTORY_FIELDS
@@ -153,10 +158,13 @@ class SubscriptionSnapshot:
     year: Optional[str] = None
     type: Optional[str] = None
     keyword: Optional[str] = None
+    search_interval: Optional[int] = None
     media_source: Optional[MediaSource] = None
     media_id: Optional[str] = None
     music_type: Optional[str] = None
     total_tracks: Optional[int] = None
+    # 专辑已接受资源中可识别音轨的稳定键；只存在于活动订阅，完成后不写入历史。
+    downloaded_tracks: Optional[builtins.list[str]] = None
     season: Optional[int] = None
     poster: Optional[str] = None
     backdrop: Optional[str] = None
@@ -179,6 +187,7 @@ class SubscriptionSnapshot:
     note: Optional[builtins.list[int]] = None
     state: str = "N"
     last_update: Optional[str] = None
+    last_search: Optional[str] = None
     date: Optional[str] = None
     username: Optional[str] = None
     sites: Optional[builtins.list[int]] = None
@@ -202,7 +211,7 @@ class SubscriptionSnapshot:
 
     def __post_init__(self) -> None:
         """冻结订阅中的全部 JSON 列。"""
-        for name in ("note", "sites", "episode_priority", "filter_groups"):
+        for name in ("note", "downloaded_tracks", "sites", "episode_priority", "filter_groups"):
             object.__setattr__(self, name, _freeze_json(getattr(self, name)))
 
     def to_dict(self) -> dict[str, JsonData]:
@@ -219,6 +228,7 @@ class SubscriptionHistorySnapshot:
     year: Optional[str] = None
     type: Optional[str] = None
     keyword: Optional[str] = None
+    search_interval: Optional[int] = None
     media_source: Optional[MediaSource] = None
     media_id: Optional[str] = None
     music_type: Optional[str] = None
@@ -560,6 +570,7 @@ class SubscriptionWritePort(Protocol):
         """在独立异步事务中新增订阅；occurrence_id 标识本次创建事实。"""
         ...
 
+
 class SubscriptionStagingPort(Protocol):
     """复用调用方 Session 且不自行提交的订阅写端口。"""
 
@@ -596,8 +607,13 @@ class SubscriptionStagingPort(Protocol):
         """异步按媒体身份读取删除候选快照。"""
         ...
 
-    async def list_search_ids(self, username: str, state: str) -> builtins.list[int]:
-        """异步读取用户可搜索订阅主键。"""
+    async def list_search_ids(
+        self,
+        username: Optional[str],
+        state: str,
+        mtype: Optional[str] = None,
+    ) -> builtins.list[int]:
+        """异步读取用户或管理员指定媒体类型范围内可搜索的订阅主键。"""
         ...
 
     async def stage_delete(self, subscribe_id: int) -> None:

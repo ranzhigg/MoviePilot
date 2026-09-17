@@ -10,13 +10,18 @@ from typing import Any, TypeVar, cast
 import pytest
 
 from app.api.endpoints import media as media_endpoint
+from app.application.classification.analysis import ClassificationAnalysisService
 from app.application.classification.configuration import (
     ClassificationPolicyConfigurationService,
     build_default_classification_policy,
+    with_default_music_classification,
 )
 from app.application.classification.contract import ClassificationPolicyConflictError
+from app.application.classification.legacy import migrate_legacy_category_config
 from app.application.classification.runtime import ClassificationRuntime
 from app.schemas.category import (
+    ClassificationCategory,
+    ClassificationConditionGroup,
     ClassificationPolicyState,
 )
 from app.schemas.types import SystemConfigKey
@@ -91,6 +96,38 @@ def _published_default_state() -> ClassificationPolicyState:
     return ClassificationPolicyState(active=policy)
 
 
+def _published_legacy_default_state() -> ClassificationPolicyState:
+    """构造旧版本仅含三个未分类兜底的 revision 1 状态。"""
+    policy = build_default_classification_policy()
+    policy.categories = [
+        ClassificationCategory(
+            id="movie.uncategorized",
+            media_type="电影",
+            name="未分类",
+            path=["未分类"],
+        ),
+        ClassificationCategory(
+            id="tv.uncategorized",
+            media_type="电视剧",
+            name="未分类",
+            path=["未分类"],
+        ),
+        ClassificationCategory(
+            id="music.uncategorized",
+            media_type="音乐",
+            name="未分类",
+            path=["未分类"],
+        ),
+    ]
+    policy.rules = []
+    policy.fallbacks = {
+        "电影": "movie.uncategorized",
+        "电视剧": "tv.uncategorized",
+        "音乐": "music.uncategorized",
+    }
+    return ClassificationPolicyState(active=policy.model_copy(update={"revision": 1}))
+
+
 @pytest.mark.asyncio  # type: ignore[misc]
 async def test_existing_policy_never_reads_legacy_yaml(
     monkeypatch: pytest.MonkeyPatch,
@@ -125,6 +162,298 @@ async def test_existing_policy_never_reads_legacy_yaml(
 
 
 @pytest.mark.asyncio  # type: ignore[misc]
+async def test_deleted_legacy_rules_keep_validation_and_impact_analysis_working(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """重启加载只剩旧别名的策略后，校验和影响分析仍应可用。"""
+    migrated = migrate_legacy_category_config(
+        {
+            "movie": {"中文电影": {"original_language": "zh"}},
+            "tv": {},
+        }
+    )
+    policy = with_default_music_classification(migrated.policy).model_copy(
+        deep=True,
+        update={"rules": []},
+    )
+    state = ClassificationPolicyState(active=policy)
+    store = _MemoryPolicyStore(state)
+    system_config = _SystemConfig(
+        {
+            SystemConfigKey.MediaClassificationPolicy.value: state.model_dump(
+                mode="json"
+            )
+        }
+    )
+    monkeypatch.setattr(
+        classification_composition,
+        "SystemConfigClassificationPolicyStore",
+        lambda *_args: store,
+    )
+
+    composition = await classification_composition.compose_classification(
+        executor=cast(Any, _InlineExecutor()),
+        settings=cast(Any, SimpleNamespace(CONFIG_PATH=tmp_path)),
+        system_config=cast(Any, system_config),
+    )
+    analysis = ClassificationAnalysisService(composition.runtime.service)
+
+    assert analysis.validate(policy).valid
+    impact = await analysis.impact(
+        policy,
+        expected_revision=1,
+        sample_limit=10,
+        example_limit=2,
+    )
+    assert impact.baseline_revision == 1
+    assert impact.candidate_revision == 2
+    assert impact.sample_count == 0
+
+
+@pytest.mark.asyncio  # type: ignore[misc]
+async def test_untouched_legacy_default_policy_gains_music_rules_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """旧版未编辑默认策略应幂等升级，用户已发布的其它策略不得被误判。"""
+    state = _published_legacy_default_state()
+    store = _MemoryPolicyStore(state)
+    system_config = _SystemConfig(
+        {
+            SystemConfigKey.MediaClassificationPolicy.value: state.model_dump(
+                mode="json"
+            )
+        }
+    )
+    monkeypatch.setattr(
+        classification_composition,
+        "SystemConfigClassificationPolicyStore",
+        lambda *_args: store,
+    )
+
+    composition = await classification_composition.compose_classification(
+        executor=cast(Any, _InlineExecutor()),
+        settings=cast(Any, SimpleNamespace(CONFIG_PATH=tmp_path)),
+        system_config=cast(Any, system_config),
+    )
+
+    policy = composition.runtime.require_policy()
+    assert composition.migrated is True
+    assert policy.revision == 2
+    assert [
+        category.path
+        for category in policy.categories
+        if category.media_type == "音乐"
+    ] == [
+        ["未分类"],
+        ["Album"],
+        ["Album", "Compilation"],
+        ["EP"],
+        ["Single"],
+    ]
+    assert [rule.id for rule in policy.rules] == [
+        "music.compilation.default",
+        "music.ep.default",
+        "music.single.default",
+        "music.album.default",
+    ]
+    assert store.write_count == 1
+
+    assert store.state is not None
+    system_config.publish_many(
+        {
+            SystemConfigKey.MediaClassificationPolicy: store.state.model_dump(
+                mode="json"
+            )
+        }
+    )
+    reloaded = await classification_composition.compose_classification(
+        executor=cast(Any, _InlineExecutor()),
+        settings=cast(Any, SimpleNamespace(CONFIG_PATH=tmp_path)),
+        system_config=cast(Any, system_config),
+    )
+
+    assert reloaded.migrated is False
+    assert reloaded.runtime.require_policy() == policy
+    assert store.write_count == 1
+
+
+@pytest.mark.asyncio  # type: ignore[misc]
+async def test_custom_movie_policy_with_legacy_music_fallback_gains_music_rules(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """其它媒体已自定义时，仍应只升级完全未编辑的旧版音乐兜底。"""
+    state = _published_legacy_default_state()
+    categories = [
+        category.model_copy(
+            deep=True,
+            update={"name": "我的电影", "path": ["我的电影"]},
+        )
+        if category.id == "movie.uncategorized"
+        else category.model_copy(deep=True)
+        for category in state.active.categories
+    ]
+    state = ClassificationPolicyState(
+        active=state.active.model_copy(
+            deep=True,
+            update={"categories": categories},
+        )
+    )
+    store = _MemoryPolicyStore(state)
+    system_config = _SystemConfig(
+        {
+            SystemConfigKey.MediaClassificationPolicy.value: state.model_dump(
+                mode="json"
+            )
+        }
+    )
+    monkeypatch.setattr(
+        classification_composition,
+        "SystemConfigClassificationPolicyStore",
+        lambda *_args: store,
+    )
+
+    composition = await classification_composition.compose_classification(
+        executor=cast(Any, _InlineExecutor()),
+        settings=cast(Any, SimpleNamespace(CONFIG_PATH=tmp_path)),
+        system_config=cast(Any, system_config),
+    )
+
+    policy = composition.runtime.require_policy()
+    assert composition.migrated is True
+    assert policy.revision == 2
+    assert next(
+        category for category in policy.categories if category.id == "movie.uncategorized"
+    ).path == ["我的电影"]
+    assert [
+        category.id for category in policy.categories if category.media_type == "音乐"
+    ] == [
+        "music.uncategorized",
+        "music.album",
+        "music.compilation",
+        "music.ep",
+        "music.single",
+    ]
+    assert store.write_count == 1
+
+
+@pytest.mark.asyncio  # type: ignore[misc]
+async def test_edited_legacy_default_policy_is_not_automatically_changed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """即使仍是 revision 1，用户改过的默认策略也不得被启动升级覆盖。"""
+    state = _published_legacy_default_state()
+    categories = [
+        category.model_copy(
+            deep=True,
+            update={"name": "自定义音乐", "path": ["自定义音乐"]},
+        )
+        if category.id == "music.uncategorized"
+        else category.model_copy(deep=True)
+        for category in state.active.categories
+    ]
+    state = ClassificationPolicyState(
+        active=state.active.model_copy(
+            deep=True,
+            update={"categories": categories},
+        )
+    )
+    store = _MemoryPolicyStore(state)
+    system_config = _SystemConfig(
+        {
+            SystemConfigKey.MediaClassificationPolicy.value: state.model_dump(
+                mode="json"
+            )
+        }
+    )
+    monkeypatch.setattr(
+        classification_composition,
+        "SystemConfigClassificationPolicyStore",
+        lambda *_args: store,
+    )
+
+    composition = await classification_composition.compose_classification(
+        executor=cast(Any, _InlineExecutor()),
+        settings=cast(Any, SimpleNamespace(CONFIG_PATH=tmp_path)),
+        system_config=cast(Any, system_config),
+    )
+
+    assert composition.migrated is False
+    assert composition.runtime.require_policy() == state.active
+    assert store.write_count == 0
+
+
+@pytest.mark.asyncio  # type: ignore[misc]
+async def test_fresh_environment_initializes_builtin_default_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """没有旧配置文件的新环境应持久化完整内置分类，而不是只有未分类兜底。"""
+    store = _MemoryPolicyStore()
+    monkeypatch.setattr(
+        classification_composition,
+        "SystemConfigClassificationPolicyStore",
+        lambda *_args: store,
+    )
+
+    composition = await classification_composition.compose_classification(
+        executor=cast(Any, _InlineExecutor()),
+        settings=cast(Any, SimpleNamespace(CONFIG_PATH=tmp_path)),
+        system_config=cast(Any, _SystemConfig({})),
+    )
+
+    policy = composition.runtime.require_policy()
+    assert composition.migrated is False
+    assert policy.revision == 1
+    assert [category.id for category in policy.categories] == [
+        "movie.animation",
+        "movie.chinese",
+        "movie.foreign",
+        "tv.dongman.cn",
+        "tv.dongman.jp",
+        "tv.documentary",
+        "tv.kids",
+        "tv.variety",
+        "tv.chinese",
+        "tv.western",
+        "tv.asian",
+        "tv.uncategorized",
+        "music.uncategorized",
+        "music.album",
+        "music.compilation",
+        "music.ep",
+        "music.single",
+    ]
+    assert [rule.id for rule in policy.rules] == [
+        "movie.animation.default",
+        "movie.chinese.default",
+        "tv.dongman.cn.default",
+        "tv.dongman.jp.default",
+        "tv.documentary.default",
+        "tv.kids.default",
+        "tv.variety.default",
+        "tv.chinese.default",
+        "tv.western.default",
+        "tv.asian.default",
+        "music.compilation.default",
+        "music.ep.default",
+        "music.single.default",
+        "music.album.default",
+    ]
+    assert policy.fallbacks == {
+        "电影": "movie.foreign",
+        "电视剧": "tv.uncategorized",
+        "音乐": "music.uncategorized",
+    }
+    assert store.state is not None
+    assert store.state.active == policy
+    assert store.write_count == 1
+
+
+@pytest.mark.asyncio  # type: ignore[misc]
 async def test_absent_policy_migrates_yaml_once_without_rewriting_file(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -149,6 +478,85 @@ async def test_absent_policy_migrates_yaml_once_without_rewriting_file(
     assert composition.migrated is True
     assert composition.runtime.require_policy().revision == 1
     assert store.write_count == 1
+    assert legacy_path.read_text(encoding="utf-8") == content
+
+
+@pytest.mark.asyncio
+async def test_large_legacy_enumerations_migrate_and_reload_without_losing_values(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """复现 56/31 个旧枚举值的升级场景，验证首次发布、重启和旧接口均保留全部值。"""
+    languages = ",".join(f"language{index}" for index in range(26))
+    countries = ",".join(f"country{index}" for index in range(30))
+    content = (
+        f"movie:\n  欧美电影:\n    original_language: '{languages}'\n"
+        f"    production_countries: '{countries}'\n  未分类:\n"
+        f"tv:\n  欧美漫:\n    genre_ids: '16'\n    origin_country: '{countries}'\n  未分类:\n"
+    )
+    legacy_path = tmp_path / "category.yaml"
+    legacy_path.write_text(content, encoding="utf-8")
+    store = _MemoryPolicyStore()
+    monkeypatch.setattr(classification_composition, "SystemConfigClassificationPolicyStore", lambda *_args: store)
+    system_config = _SystemConfig({})
+
+    composition = await classification_composition.compose_classification(
+        executor=cast(Any, _InlineExecutor()),
+        settings=cast(Any, SimpleNamespace(CONFIG_PATH=tmp_path)),
+        system_config=cast(Any, system_config),
+    )
+
+    assert composition.migrated is True
+    policy = composition.runtime.require_policy()
+    assert policy.revision == 1
+    legacy_rules = [rule for rule in policy.rules if "音乐" not in rule.media_types]
+    assert len(policy.rules) == 6
+    assert len(legacy_rules) == 2
+    for rule in legacy_rules:
+        assert isinstance(rule.when, ClassificationConditionGroup)
+        assert rule.when.all is not None and len(rule.when.all) == 2
+    assert store.state is not None
+    system_config.publish_many({SystemConfigKey.MediaClassificationPolicy: store.state.model_dump(mode="json")})
+    reloaded = await classification_composition.compose_classification(
+        executor=cast(Any, _InlineExecutor()),
+        settings=cast(Any, SimpleNamespace(CONFIG_PATH=tmp_path)),
+        system_config=cast(Any, system_config),
+    )
+
+    assert reloaded.migrated is False
+    assert reloaded.runtime.require_policy() == policy
+    projected = reloaded.runtime.legacy_config().model_dump(exclude_none=True)
+    assert projected["movie"]["欧美电影"]["original_language"] == languages
+    assert projected["movie"]["欧美电影"]["production_countries"] == countries
+    assert projected["tv"]["欧美漫"]["origin_country"] == countries
+    assert store.write_count == 1
+    assert legacy_path.read_text(encoding="utf-8") == content
+
+
+@pytest.mark.asyncio
+async def test_publish_validation_failure_preserves_legacy_runtime_without_writes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """真正超出叶子上限的不同字段保留错误诊断和旧配置，不得中断启动或写入新策略。"""
+    content = "movie:\n  复杂规则:\n" + "".join(f"    field{index}: 'X'\n" for index in range(31))
+    legacy_path = tmp_path / "category.yaml"
+    legacy_path.write_text(content, encoding="utf-8")
+    store = _MemoryPolicyStore()
+    monkeypatch.setattr(classification_composition, "SystemConfigClassificationPolicyStore", lambda *_args: store)
+
+    composition = await classification_composition.compose_classification(
+        executor=cast(Any, _InlineExecutor()),
+        settings=cast(Any, SimpleNamespace(CONFIG_PATH=tmp_path)),
+        system_config=cast(Any, _SystemConfig({})),
+    )
+
+    assert composition.migrated is False
+    assert composition.runtime.active_policy() is None
+    assert any(issue.code == "max_conditions_exceeded" for issue in composition.runtime.diagnostics())
+    assert "复杂规则" in (composition.runtime.legacy_config().movie or {})
+    assert store.write_count == 0
+    assert store.state is None
     assert legacy_path.read_text(encoding="utf-8") == content
 
 
@@ -190,7 +598,13 @@ def test_runtime_compat_projection_is_read_only_and_includes_music_categories() 
 
     categories = runtime.media_categories().root
 
-    assert categories["音乐"] == ["未分类"]
+    assert categories["音乐"] == [
+        "未分类",
+        "Album",
+        "Album / Compilation",
+        "EP",
+        "Single",
+    ]
     assert runtime.legacy_config().movie == {}
     assert store.write_count == 1
 
@@ -215,10 +629,17 @@ async def test_legacy_category_get_endpoints_use_classification_runtime_only(
 
     assert before.success is True
     assert before.data == {"movie": {}, "tv": {}}
+    default_policy = build_default_classification_policy()
+    expected_categories = {
+        media_type: [
+            category.name
+            for category in default_policy.categories
+            if category.media_type == media_type and category.enabled
+        ]
+        for media_type in ("电影", "电视剧", "音乐")
+    }
     assert categories.root == {
-        "电影": ["未分类"],
-        "电视剧": ["未分类"],
-        "音乐": ["未分类"],
+        **expected_categories,
     }
 
 

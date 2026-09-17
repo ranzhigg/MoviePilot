@@ -7,7 +7,11 @@ from copy import deepcopy
 from typing import Optional
 from unittest.mock import AsyncMock, Mock, patch
 
-from app.application.classification.execution import ClassificationExecutionService
+from app.application.classification.analysis import build_classification_facts_from_media
+from app.application.classification.execution import (
+    ClassificationExecutionService,
+    evaluate_classification_facts,
+)
 from app.application.classification.legacy import migrate_legacy_category_config
 from app.chain.base import ChainBase
 from app.domain.context import MediaInfo, MusicArtistInfo, MusicInfo
@@ -181,6 +185,111 @@ def test_execution_classifies_copy_and_preserves_source_identity() -> None:
     assert source.classification.policy_revision == 1
 
 
+def test_legacy_tmdb_rules_use_non_tmdb_standard_facts() -> None:
+    """旧 TMDB 分类规则应使用豆瓣等来源已有的标准国家事实。"""
+    migration = migrate_legacy_category_config(
+        {
+            "movie": {},
+            "tv": {
+                "国产剧": {"origin_country": "CN,TW,HK"},
+                "未分类": None,
+            },
+        }
+    )
+    source = MediaInfo(
+        media_source=MediaSource.Douban,
+        media_id="35593344",
+        type=MediaType.TV,
+        title="测试剧",
+        production_countries=[{"name": "中国大陆"}],
+    )
+
+    finalized = ClassificationExecutionService(
+        _Runtime(migration.policy)
+    ).finalize(source)
+
+    assert finalized.media_source == MediaSource.Douban
+    assert finalized.library_category == "国产剧"
+    assert finalized.classification is not None
+    assert finalized.classification.effective.category_id == next(
+        category.id
+        for category in migration.policy.categories
+        if category.name == "国产剧"
+    )
+
+
+def test_legacy_compatibility_preserves_primary_source_provenance() -> None:
+    """旧 TMDB 规则兼容求值不得把非 TMDB 主身份伪装成 TMDB。"""
+    migration = migrate_legacy_category_config(
+        {"movie": {"华语电影": {"original_language": "zh"}}, "tv": {}}
+    )
+    media = MediaInfo(
+        media_source=MediaSource.Douban,
+        media_id="douban-1",
+        type=MediaType.MOVIE,
+        original_language="zh",
+    )
+    facts = build_classification_facts_from_media(media)
+
+    evaluation = evaluate_classification_facts(migration.policy, facts)
+
+    assert evaluation.facts.identity.media_source == MediaSource.Douban.value
+    assert all(
+        warning.source == MediaSource.Douban.value for warning in evaluation.warnings
+    )
+
+
+def test_non_tmdb_tmdb_info_does_not_override_primary_standard_facts() -> None:
+    """非 TMDB 媒体携带的旧 tmdb_info 不得覆盖主来源标准事实。"""
+    migration = migrate_legacy_category_config(
+        {
+            "movie": {
+                "华语电影": {"original_language": "zh"},
+                "外语电影": None,
+            },
+            "tv": {},
+        }
+    )
+    media = MediaInfo(
+        media_source=MediaSource.Douban,
+        media_id="douban-1",
+        type=MediaType.MOVIE,
+        original_language="zh",
+        tmdb_info={"original_language": "en"},
+    )
+
+    finalized = ClassificationExecutionService(_Runtime(migration.policy)).finalize(media)
+
+    assert finalized.library_category == "华语电影"
+
+
+def test_execution_builds_complete_facts_without_mutating_media() -> None:
+    """影响分析事实入口应复用插件字段构造，并保持原媒体对象不变。"""
+    source = MediaInfo(
+        media_source=MediaSource.Douban,
+        media_id="native-1",
+        type=MediaType.MOVIE,
+        title="Example",
+        genres=[{"name": "动画"}],
+        origin_country=["JP"],
+    )
+    service = ClassificationExecutionService(
+        _Runtime(_policy()),
+        extension_facts_provider=lambda media: {
+            "example.source": {"region_group": "east-asia"}
+        },
+    )
+
+    facts = asyncio.run(service.async_build_facts(source))
+
+    assert facts is not None
+    assert facts.identity.media_id == "native-1"
+    assert facts.media.genre_keys == ["animation"]
+    assert facts.media.countries == ["JP"]
+    assert facts.extensions["example.source"]["region_group"] == "east-asia"
+    assert source.classification is None
+
+
 def test_execution_reclassifies_cached_result_after_policy_revision_changes() -> None:
     """缓存对象携带旧 revision 时必须按当前策略重新分类。"""
     runtime = _Runtime(_policy(revision=7))
@@ -223,6 +332,69 @@ def test_execution_refreshes_same_revision_after_auxiliary_facts_change() -> Non
     assert refreshed.library_category == "动画/日本"
     assert refreshed.classification is not None
     assert refreshed.classification.effective.rule_id == "rule.movie.jp"
+
+
+def test_execution_preserves_automatic_category_when_supplement_drops_facts() -> None:
+    """裁剪过字段的媒体再次分类时，同策略已命中的自动分类不得被兜底覆盖。"""
+    migration = migrate_legacy_category_config(
+        {
+            "movie": {},
+            "tv": {
+                "国产剧": {"origin_country": "CN,TW,HK"},
+                "未分类": None,
+            },
+        }
+    )
+    domestic = next(
+        category.id
+        for category in migration.policy.categories
+        if category.name == "国产剧"
+    )
+    service = ClassificationExecutionService(_Runtime(migration.policy))
+    source = MediaInfo(
+        media_source=MediaSource.Douban,
+        media_id="35593344",
+        type=MediaType.TV,
+        title="测试剧",
+        production_countries=[{"name": "中国大陆"}],
+    )
+    classified = service.finalize(source)
+    assert classified.classification.effective.category_id == domestic
+    assert classified.classification.state == "complete"
+
+    classified.clear()
+    supplemented = service.finalize(classified)
+
+    assert supplemented.classification is not None
+    assert supplemented.classification.effective.category_id == domestic
+    assert supplemented.classification.effective.source == "automatic"
+    assert supplemented.library_category == "国产剧"
+    # 本次求值确实缺事实，推荐结果和状态仍如实记录，供预览解释差异。
+    assert supplemented.classification.state == "partial"
+    assert supplemented.classification.recommended.source == "fallback"
+
+
+def test_execution_keeps_fallback_when_complete_facts_no_longer_match() -> None:
+    """事实读齐后不再命中规则时，兜底结果必须生效而不是复用旧自动分类。"""
+    service = ClassificationExecutionService(_Runtime(_policy()))
+    source = MediaInfo(
+        media_source="douban",
+        media_id="1",
+        type=MediaType.MOVIE,
+        origin_country=["JP"],
+        genres=[{"name": "动画"}],
+    )
+    classified = service.finalize(source)
+    assert classified.classification.effective.category_id == "movie.jp"
+
+    classified.origin_country = ["US"]
+    reclassified = service.finalize(classified)
+
+    assert reclassified.classification is not None
+    assert reclassified.classification.state == "complete"
+    assert reclassified.classification.effective.category_id == "movie.other"
+    assert reclassified.classification.effective.source == "fallback"
+    assert reclassified.library_category == "其它电影"
 
 
 def test_execution_applies_manual_effective_override_without_losing_recommendation() -> None:

@@ -20,6 +20,7 @@ Models are SQLAlchemy declarative classes. Each model maps to one database table
 | `Message` | Message log |
 | `PluginData` | Plugin-persisted data |
 | `PluginIdentity` | Installed physical-plugin source binding and payload provenance |
+| `PluginInstance` | Per-instance plugin descriptor and configuration, one row per instance |
 | `PassKey` | Passkey authentication records |
 | `Workflow` | Workflow definitions |
 
@@ -63,6 +64,7 @@ directly in chain, module, or endpoint code.
 | `MessageOper` | `oper/message.py` |
 | `PluginDataOper` | `oper/plugindata.py` |
 | `PluginIdentityOper` | `oper/pluginidentity.py` |
+| `PluginInstanceOper` | `oper/plugininstance.py` |
 | `SiteOper` | `oper/site.py` |
 | `SubscribeHistoryOper` | `oper/subscribehistory.py` |
 | `SubscribeOper` | `oper/subscribe.py` |
@@ -205,6 +207,20 @@ shared `DATA_CLEANUP_ENABLE` policy when it has a safe time boundary:
 - `agentchat` removes only expired sessions not referenced by an `agenttask`;
   `agenttaskrun` removes only expired terminal runs that are neither running nor
   the task's current `last_run_id`.
+- `agentinvocation` stores only write-call identity, argument digests and fixed
+  host status summaries. Successful/failed receipts and pending receipts that
+  confirm an asynchronous submission are deleted in the same transaction as
+  their owning chat, including shared chat retention cleanup. Pending means
+  submission is confirmed while downstream completion has not been observed;
+  it is history rather than a queue to execute. Replaying the same invocation
+  never repeats submission, but a new user intent may submit again.
+  These history receipts without a chat (including background task calls) use the
+  same Agent chat retention period, based on their UTC settlement timestamp;
+  both the shared cleanup switch and a zero-day retention disable this cleanup.
+  Running/unknown receipts are recovery state and have no age-based deletion;
+  they also protect their chat from automatic retention cleanup. Cold startup
+  changes running receipts to unknown and rotates their fencing token; elapsed
+  time never grants permission to repeat the write.
 - `outboxmessage` has separate completed and dead-letter retention periods;
   pending and processing intents are recovery state and are never age-deleted.
 
@@ -264,6 +280,20 @@ precedence over declared models and is applied with `alembic upgrade head`;
 it must be an absolute, existing directory — `ensure` raises
 `FileNotFoundError` before creating anything rather than leaving behind a
 database with neither tables nor a version stamp.
+
+Before the upgrade runs, `run_migrations` compares the revisions already
+stamped in the plugin database against the script tree shipped with the
+installed plugin version. A revision that tree cannot locate means the
+database was stamped by a newer build — the ordinary outcome of reinstalling
+an older version — and the host raises `PluginMigrationCompatibilityError`
+naming both the revision and the directory instead of letting Alembic fail
+with a bare `Can't locate revision`. The host never downgrades automatically:
+downgrade scripts normally drop tables and columns, so running them unattended
+would destroy whatever the user produced under the newer version, with no way
+back. Recovery is to install a plugin version whose migration tree contains
+that revision, or to have an administrator perform an explicit data migration.
+A database with no `alembic_version` table yet reports no revisions, so first
+creation is never blocked by this check.
 
 Models must inherit `app.sdk.database.plugin_declarative_base()`, which mints
 a fresh `MetaData` per call so a plugin's tables never collide with
@@ -331,6 +361,16 @@ configuration.set(SystemConfigKey.RssUrls, ["https://example.com/rss"])
 ```
 
 **Rule:** Never use raw string literals as `SystemConfig` keys. Always define a new `SystemConfigKey` enum entry first. Raw string key lookups are not searchable and cannot be refactored safely.
+
+**Rule:** Plugin configuration is not `SystemConfig`. A plugin instance's own settings
+live on its `PluginInstance` row (`plugininstance.config_data`) and are reached through
+the plugin configuration channel — `_PluginBase.get_config()` / `update_config()` for
+plugins, `PluginConfigStore` and the `PluginStorage` instance-config ports for the host.
+`SystemConfigOper` treats every key alike and holds no knowledge of plugins; it must
+never branch on a key's value. A plugin that reads or writes its own configuration
+directly through `SystemConfig` (for example under a `plugin.<PluginId>` key) is
+unsupported: such a key is an ordinary, unrelated `SystemConfig` row that the plugin
+configuration channel neither reads nor writes.
 
 ---
 
@@ -427,4 +467,4 @@ can be accepted only once without Application knowing the configured backend.
 - `settings.API_TOKEN` and other secret fields must not be included in log output or API responses.
 - The `config list --show-secrets` flag exists specifically to gate secret visibility in the CLI.
 
-*Last Updated: 2026-09-02*
+*Last Updated: 2026-09-13*

@@ -199,6 +199,27 @@ def _bind_checkpoint(task: TransferTask, checkpoint) -> None:
     binder(checkpoint)
 
 
+@pytest.mark.parametrize(
+    ("scrape", "expected"),
+    [(None, True), (False, False), (True, True)],
+)
+def test_planning_input_freezes_effective_directory_scrape_setting(scrape, expected):
+    """旧 ABI 省略刮削参数时冻结目标目录开关，显式值仍保持原意。"""
+    task = _task()
+    task.target_directory = TransferDirectoryConf(
+        name="library",
+        transfer_type="copy",
+        library_path="/library",
+        scraping=True,
+    )
+    task.scrape = scrape
+
+    planning_input = _chain()._TransferChain__build_planning_input(task)
+
+    assert planning_input.need_scrape is expected
+    assert planning_input.options["scrape"] is scrape
+
+
 def _planned_admission(task: TransferTask, checkpoint):
     """构造仓储 checkpoint 提交后返回的冻结投影。"""
     return SimpleNamespace(
@@ -388,6 +409,24 @@ def _chain(*, repository=None, checkpoint=None, result=None) -> TransferChain:
 
     chain.run_module = Mock(side_effect=run_module)
     return chain
+
+
+def test_durable_host_execution_propagates_module_errors_to_transfer_boundary():
+    """持久执行通过 dispatcher 的异常传播开关，避免先被系统错误处理器吞掉。"""
+    chain = _chain()
+    chain.run_module.side_effect = RuntimeError("manual review")
+
+    with pytest.raises(RuntimeError, match="manual review"):
+        chain._TransferChain__execute_host_transfer_plan(
+            _task(),
+            _checkpoint(),
+            source_oper=None,
+            target_oper=None,
+            step_runner=Mock(),
+        )
+
+    call = chain.run_module.call_args
+    assert call.kwargs["raise_exception"] is True
 
 
 def _replay_chain(repository) -> TransferChain:
@@ -1370,6 +1409,36 @@ def test_host_planning_value_error_commits_rejection_instead_of_retrying():
     assert task.plan_checkpoint.items == ()
     assert task.execution_checkpoint is not None
     repository.record_planning_failure.assert_not_called()
+
+
+def test_missing_library_directory_commits_rejection_without_file_execution():
+    """真实目录匹配失败应提交业务拒绝检查点，无文件副作用或异常重试。"""
+    repository = Mock()
+    task = _task()
+    task.target_path = None
+    task.mediainfo = MediaInfo(title="Movie", year="2026")
+    task.bind_admission_task_id("task-missing-library")
+    _bind_planning_input(task, replace(
+        _planning_input(), target_directory=None, target_path=None,
+    ))
+    repository.checkpoint_plan.side_effect = lambda **kwargs: _planned_admission(
+        task, kwargs["checkpoint"],
+    )
+    chain = _chain(repository=repository)
+    module = object.__new__(FileManagerModule)
+    chain.plan_transfer.side_effect = module.plan_transfer
+
+    with patch("app.modules.filemanager.module.Path.exists", return_value=True):
+        result = chain._plan_checkpoint_and_execute(task)
+
+    assert result.success is False
+    assert result.message == "未找到有效的媒体库目录"
+    assert task.plan_checkpoint.rejection_error == result.message
+    assert task.plan_checkpoint.items == ()
+    assert task.execution_checkpoint is not None
+    repository.checkpoint_plan.assert_called_once()
+    repository.record_planning_failure.assert_not_called()
+    chain.execute_transfer_plan.assert_not_called()
 
 
 def test_post_commit_crash_replays_frozen_plan_without_replanning():

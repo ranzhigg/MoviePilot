@@ -93,7 +93,7 @@ class ConfigurationEventPort(Protocol):
     """发布系统配置变更事实的端口。"""
 
     async def publish(self, key: Any, value: JsonData = None) -> None:
-        """发布一个已经持久化完成的配置变更。"""
+        """发布已持久化的配置变更，并在返回前完成同步重载处理器。"""
         ...
 
 
@@ -235,7 +235,7 @@ class SystemService:
         return await self._logs.collect(name)
 
     async def update_environment(self, env: dict[str, Any]) -> SystemOperationResult:
-        """校验并原子执行一批可变部署设置更新。"""
+        """校验并执行一批可变部署设置更新。"""
         validation_error = self._llm.validate(env, self.settings)
         if validation_error:
             return SystemOperationResult(False, validation_error)
@@ -246,6 +246,9 @@ class SystemService:
         success_updates = {key: value for key, value in result.items() if value[0]}
         failed_updates = {key: value for key, value in result.items() if value[0] is False}
         if failed_updates:
+            if success_updates:
+                # update_many 已经逐项提交，部分失败不能吞掉已成功配置的实时重载。
+                await self._events.publish(success_updates.keys())
             return SystemOperationResult(
                 False,
                 ", ".join(value[1] for value in failed_updates.values()),
@@ -389,7 +392,7 @@ class SystemService:
         return SystemOperationResult(status.state != "failed", status.error, status)
 
     def install_update(self, target: SystemUpdateType = "application") -> SystemOperationResult:
-        """确认指定制品并在重启失败时回滚安装请求。"""
+        """确认指定制品并安排 Docker worker 在受管重启前完成替换。"""
         if not self._control.can_restart():
             return SystemOperationResult(False, "当前运行环境不支持升级操作！")
         prepared, message = self._updates.prepare_install(target)

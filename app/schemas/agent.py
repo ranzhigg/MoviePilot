@@ -127,6 +127,7 @@ class AgentChatToolCall(BaseModel):
     """
 
     id: str = Field(..., description="展示 ID")
+    tool_name: Optional[str] = Field(None, description="工具名称")
     message: str = Field(..., description="工具提示")
     status: str = Field(default="done", description="工具状态")
 
@@ -197,6 +198,7 @@ class AgentChatMessage(BaseModel):
     attachments: list[AgentChatAttachment] = Field(default_factory=list, description="附件列表")
     choices: list[AgentChatChoiceCard] = Field(default_factory=list, description="选择卡片列表")
     choice_selection: Optional[AgentChatChoiceSelection] = Field(None, description="用户选择项快照")
+    steering_message_id: Optional[str] = Field(None, description="运行中补充消息的稳定标识")
 
 
 class AgentChatSession(BaseModel):

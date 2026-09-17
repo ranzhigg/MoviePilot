@@ -1,11 +1,13 @@
+import ast
 import importlib
 import importlib.abc
 import importlib.machinery
 import importlib.util
 import sys
 import threading
+from pathlib import Path
 from types import ModuleType
-from typing import Dict
+from typing import Dict, List, Set, Tuple
 
 from app.runtime.compat.diagnostics import record_legacy_import
 from app.runtime.compat.manifest import (
@@ -15,6 +17,7 @@ from app.runtime.compat.manifest import (
     SYMBOL_ALIASES,
     VIRTUAL_PACKAGES,
     ModuleAlias,
+    SymbolAlias,
 )
 
 
@@ -116,6 +119,88 @@ class VirtualLegacyPackageLoader(importlib.abc.Loader):
             record_legacy_import(self.package_name)
 
 
+def detect_shadowed_exports(
+    module: ModuleType,
+    exports: Dict[str, SymbolAlias],
+) -> List[Tuple[str, str]]:
+    """返回物理模块用第二份实现遮蔽的兼容符号及其 canonical 路径。
+
+    模块级 ``__getattr__`` 只在属性查找失败时触发，物理模块自带同名定义时兼容叠加
+    完全不会被调用。重新导入同一个 canonical 对象是无害的，只有身份不同才是遮蔽。
+
+    :param module: 已执行完毕的物理模块
+    :param exports: 该模块在兼容清单中登记的符号
+    :return: ``(符号名, canonical 路径)`` 列表，无遮蔽时为空
+    """
+    shadowed = []
+    for name, symbol in exports.items():
+        if name not in module.__dict__:
+            continue
+        target = importlib.import_module(symbol.target_module)
+        if module.__dict__[name] is not getattr(target, symbol.target_name):
+            shadowed.append((name, symbol.replacement))
+    return shadowed
+
+
+PLUGINS_PACKAGE = "app.plugins"
+PLUGINS_PACKAGE_ROOT_BACKUP_SUFFIX = ".legacy-bak"
+# 必须与 app/plugins/__init__.py 完全一致，tests/test_legacy_import_compat.py 校验同步
+PLUGINS_PACKAGE_ROOT_SOURCE = (
+    '"""插件安装命名空间；契约基类由 app.sdk.plugin 拥有，旧包根符号由 Compat 惰性解析。"""\n'
+)
+
+
+def _top_level_bindings(source: str) -> Set[str]:
+    """返回模块顶层由类、函数或赋值绑定的名称，导入绑定不计入。"""
+    names: Set[str] = set()
+    for node in ast.parse(source).body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            names.update(
+                target.id for target in node.targets if isinstance(target, ast.Name)
+            )
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+    return names
+
+
+def detect_plugins_package_root_shadowing(init_file: Path) -> List[str]:
+    """返回插件安装包根源码里自带第二份实现的兼容符号名。
+
+    只统计顶层类、函数和赋值：重新导入同一个 canonical 对象无害，判定口径与
+    :func:`detect_shadowed_exports` 一致。源码缺失、不可读或语法错误时返回空列表，
+    把这些故障留给标准导入流程如实报告。
+
+    :param init_file: 运行目录中的 ``app/plugins/__init__.py``
+    :return: 被遮蔽的兼容符号名，按名称排序；正常包根为空列表
+    """
+    try:
+        bindings = _top_level_bindings(init_file.read_text(encoding="utf-8-sig"))
+    except (OSError, SyntaxError, ValueError):
+        return []
+    return sorted(bindings & set(SYMBOL_ALIASES.get(PLUGINS_PACKAGE, {})))
+
+
+def restore_plugins_package_root(init_file: Path) -> Path:
+    """备份自带实现的插件安装包根，并写回只含说明的命名空间入口。
+
+    包根属于后端源码提供的兼容入口，旧版本的同名实现随插件运行目录迁移进来后会遮蔽
+    兼容符号；改写后本进程尚未导入的插件即可正常解析旧符号。运行目录只读时抛出
+    ``OSError``，由调用方决定如何降级。
+
+    :param init_file: 运行目录中的 ``app/plugins/__init__.py``
+    :return: 备份文件路径
+    """
+    backup_file = init_file.with_name(
+        init_file.name + PLUGINS_PACKAGE_ROOT_BACKUP_SUFFIX
+    )
+    backup_file.write_bytes(init_file.read_bytes())
+    init_file.write_text(PLUGINS_PACKAGE_ROOT_SOURCE, encoding="utf-8")
+    importlib.invalidate_caches()
+    return backup_file
+
+
 class LegacySymbolOverlayLoader(importlib.abc.Loader):
     """在标准物理模块执行后叠加旧符号的惰性解析，不修改 canonical 源码。"""
 
@@ -161,6 +246,18 @@ class LegacySymbolOverlayLoader(importlib.abc.Loader):
         executor(module)
 
         exports = SYMBOL_ALIASES[self.module_name]
+        shadowed = detect_shadowed_exports(module, exports)
+        if shadowed:
+            detail = "；".join(
+                f"{self.module_name}.{name} 覆盖了 {replacement}"
+                for name, replacement in shadowed
+            )
+            raise ImportError(
+                f"模块 {self.module_name} 自带第二份实现遮蔽了兼容符号：{detail}。"
+                f"通常是把旧版本的同名目录挂载或复制到了运行目录，"
+                f"请让该包只保留不含实现的 __init__.py",
+                name=self.module_name,
+            )
         previous_getattr = module.__dict__.get("__getattr__")
         previous_dir = module.__dict__.get("__dir__")
         had_all = "__all__" in module.__dict__

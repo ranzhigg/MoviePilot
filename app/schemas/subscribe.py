@@ -4,6 +4,7 @@ from typing import Any, ClassVar, Dict, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.schemas.media import OptionalMediaIdentityMixin
+from app.schemas.types import MUSIC_ENTITY_ALBUM as _MUSIC_ENTITY_ALBUM
 from app.schemas.types import MediaSource, MediaType
 
 
@@ -45,6 +46,36 @@ def compute_subscribe_completed_episode(subscribe: "Subscribe") -> Optional[int]
     return min(max(start_episode - 1, 0), total_episode) + priority_completed
 
 
+def compute_subscribe_completed_tracks(subscribe: Any) -> Optional[int]:
+    """计算专辑订阅已累计曲目数，仅用于响应派生，不把内部音轨键暴露给客户端。"""
+    def value(name: str) -> Any:
+        """从快照、ORM 行或字典读取订阅字段。"""
+        if isinstance(subscribe, dict):
+            return subscribe.get(name)
+        return getattr(subscribe, name, None)
+
+    if isinstance(subscribe, dict):
+        has_track_facts = "downloaded_tracks" in subscribe
+    else:
+        has_track_facts = hasattr(subscribe, "downloaded_tracks")
+    if not has_track_facts:
+        return None
+
+    if value("type") != MediaType.MUSIC.value or value("music_type") != _MUSIC_ENTITY_ALBUM:
+        return None
+    try:
+        total_tracks = int(value("total_tracks") or 0)
+    except (TypeError, ValueError):
+        return None
+    if total_tracks <= 0:
+        return None
+    downloaded_tracks = value("downloaded_tracks") or []
+    if not isinstance(downloaded_tracks, (list, tuple, set, frozenset)):
+        return 0
+    completed_tracks = len({item for item in downloaded_tracks if isinstance(item, str) and item})
+    return min(completed_tracks, total_tracks)
+
+
 class SubscriptionExecutionStatus(BaseModel):  # type: ignore[misc]
     """订阅列表可见的当前业务执行状态。"""
 
@@ -55,6 +86,7 @@ class SubscriptionExecutionStatus(BaseModel):  # type: ignore[misc]
     batch_id: Optional[str] = None
     task_id: Optional[str] = None
     current_site_id: Optional[int] = None
+    next_run_at: Optional[str] = None
     error: Optional[str] = None
     can_cancel: bool = False
 
@@ -84,6 +116,17 @@ class SubscriptionBatchStatus(BaseModel):  # type: ignore[misc]
     model_config = ConfigDict(from_attributes=True)
 
 
+class SubscriptionSearchSubmission(BaseModel):  # type: ignore[misc]
+    """手工订阅搜索已安排后的轻量跟踪信息。"""
+
+    batch_id: Optional[str] = None
+    batch_ids: List[str] = Field(default_factory=list)
+    target_count: int = 0
+    queued_count: int = 0
+    ongoing_count: int = 0
+    single: bool = False
+
+
 class Subscribe(OptionalMediaIdentityMixin, BaseModel):
     """订阅输入与响应模型，媒体身份必须为空对或完整有效对。"""
 
@@ -95,11 +138,11 @@ class Subscribe(OptionalMediaIdentityMixin, BaseModel):
 
     # 公共创建和更新接口不得接收系统字段和运行事实；其余字段默认作为订阅输入透传。
     PUBLIC_WRITE_EXCLUDED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "id", "poster", "backdrop", "vote", "description", "lack_episode", "completed_episode",
+        "id", "poster", "backdrop", "vote", "description", "lack_episode", "completed_episode", "completed_tracks",
         "note", "state", "last_update", "username", "current_priority", "episode_priority", "date",
         "current_audio_format", "current_bitrate", "current_bit_depth", "current_sample_rate",
         "classification_rule_id", "classification_policy_revision", "classification_source",
-        "execution_status",
+        "execution_status", "last_search",
     })
 
     id: Optional[int] = None
@@ -109,6 +152,10 @@ class Subscribe(OptionalMediaIdentityMixin, BaseModel):
     year: Optional[str] = None
     # 订阅类型 电影/电视剧
     type: Optional[str] = None
+    # 定时搜索间隔（小时）；空值跟随系统设置
+    search_interval: Optional[int] = Field(default=None, ge=1, le=8760)
+    # 最近一次主动搜索开始时间，仅供读取
+    last_search: Optional[str] = None
     # 搜索关键字
     keyword: Optional[str] = None
     media_source: Optional[MediaSource] = None
@@ -117,6 +164,8 @@ class Subscribe(OptionalMediaIdentityMixin, BaseModel):
     music_type: Optional[str] = None
     # 专辑预期总曲目数
     total_tracks: Optional[int] = None
+    # 已累计下载曲目数，仅由后端根据专辑音轨事实派生
+    completed_tracks: Optional[int] = None
     # 季号
     season: Optional[int] = None
     # 海报
@@ -250,7 +299,7 @@ class Subscribe(OptionalMediaIdentityMixin, BaseModel):
             data = dict(data)
             for key, value in list(data.items()):
                 if isinstance(value, str) and value == "":
-                    if key in {"media_source", "media_id"} or key in cls.CLEARABLE_FILTER_FIELDS:
+                    if key in {"media_source", "media_id", "search_interval"} or key in cls.CLEARABLE_FILTER_FIELDS:
                         data[key] = None
                     else:
                         data.pop(key)

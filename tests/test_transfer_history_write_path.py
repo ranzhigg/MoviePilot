@@ -9,7 +9,7 @@
 因此这里断言的是「落库后每个字段的实际值」，不是「调用了什么」。
 
 它们与同一张表的读侧规则（查重闸，见 test_transfer_history_gate.py）同住
-app/application/history.py；此前长在 TransferHistoryOper 上，故本文件旧名为
+app/application/history/；此前长在 TransferHistoryOper 上，故本文件旧名为
 test_db_transferhistory_write_path.py。
 """
 import pytest
@@ -262,6 +262,31 @@ def test_add_fail_records_the_transfer_error_message(db):
     assert row.status is False
     assert row.errmsg == "目标路径不可写"
     assert row.title == "识别标题"
+
+
+def test_add_fail_persists_feedback_stage_and_retry_state(db):
+    """
+    失败历史要同时保存阶段、恢复动作和跨重启可用的重试状态。
+    """
+    oper = _repository()
+
+    add_transfer_fail(
+        transfer_history_oper=oper,
+        fileitem=_fileitem("/downloads/feedback.mkv"),
+        mode="move",
+        meta=MetaInfo("feedback.mkv"),
+        mediainfo=_mediainfo(),
+        transferinfo=_transferinfo(message="目标路径不可写"),
+        retry_count=3,
+        auto_paused=True,
+    )
+
+    row = oper.get_by_src("/downloads/feedback.mkv")
+    assert row.failure_stage == "destination_access"
+    assert "目标存储" in (row.recovery_action or "")
+    assert row.retry_count == 3
+    assert row.auto_paused is True
+    assert row.retry_exhausted is True
 
 
 def test_add_fail_uses_a_default_message_when_none_given(db):

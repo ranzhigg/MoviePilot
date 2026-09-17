@@ -8,12 +8,15 @@ from typing import Any, Dict, Optional, Type
 
 from pydantic import BaseModel, Field, PrivateAttr
 
+from app.agent.api.arguments import api_input_contract, canonical_api_arguments
 from app.agent.api.executor import ApiExecutionContext, ApiExecutionError, MoviePilotApiExecutor
 from app.agent.policy.api import resolve_api_operation
-from app.agent.policy.contracts import PrincipalRole
+from app.agent.policy.contracts import ExecutionOutcome, PrincipalRole
 from app.agent.policy.sanitizer import summarize_input
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.result import inspect_tool_result
 from app.agent.tools.tags import ToolTag
+from app.schemas.common import JsonData
 from app.schemas.types import NotificationChannel
 
 _TOOL_MESSAGE_OPERATION_MAX_CHARS = 96
@@ -53,11 +56,13 @@ class MoviePilotApiInput(BaseModel):  # type: ignore[misc]
         default_factory=dict,
         description="Query-string fields declared by the selected operation.",
     )
-    body: Any = Field(
+    body: JsonData = Field(
         default=None,
         description=(
             "JSON request value declared by the selected operation and its loaded Skill contract. "
-            "Most operations use an object; a oneOf branch may require an exact scalar."
+            "Most operations use an object; a oneOf branch may require an exact scalar. "
+            "Keep objects and arrays, including nested file items, as native JSON values; "
+            "never JSON-encode them into strings."
         ),
     )
 
@@ -80,11 +85,9 @@ class MoviePilotApiTool(MoviePilotTool):
         ToolTag.Plugin,
     ]
     description: str = (
-        "Call allowlisted MoviePilot business APIs. Use the domain Skill to select operation_id, "
-        "parameters, and failure handling. For collection counts, use the smallest documented "
-        "page and read collection.total_count instead of querying the database after item "
-        "truncation. External MCP tools/list exposes one complete oneOf branch per operation. "
-        "Arbitrary URLs, commands, and authentication endpoints are forbidden."
+        "Call allowlisted MoviePilot business APIs through operation-specific input contracts. "
+        "Load the relevant domain Skill before calling and use operation error feedback to correct inputs. "
+        "Arbitrary URLs, commands, authentication endpoints, headers, and tokens are forbidden."
     )
     require_admin: bool = False
     args_schema: Type[BaseModel] = MoviePilotApiInput
@@ -127,6 +130,32 @@ class MoviePilotApiTool(MoviePilotTool):
     def get_mcp_input_schema(self) -> dict[str, Any]:
         """返回包含全部白名单 operation 精确参数的 MCP JSON Schema。"""
         return deepcopy(_load_api_mcp_input_schema())
+
+    def canonical_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """用缓存的 operation 合同生成实际执行与持久指纹共用的参数。"""
+        validated = MoviePilotApiInput.model_validate(arguments).model_dump(mode="json")
+        return canonical_api_arguments(validated, _load_api_mcp_input_schema())
+
+    def get_operation_input_contract(self, operation_id: str) -> dict[str, Any]:
+        """返回单个 operation 的有界参数合同，供失败回执指导模型重试。"""
+        return api_input_contract(operation_id, _load_api_mcp_input_schema())
+
+    def _invalid_input_result(self, operation_id: str, error: Exception) -> str:
+        """把参数合同错误转换为不包含原始请求值的模型纠错回执。"""
+        contract = self.get_operation_input_contract(operation_id)
+        return json.dumps(
+            {
+                "success": False,
+                "error": "invalid_input",
+                "operation_id": operation_id,
+                "message": (
+                    f"{operation_id} 的输入不符合已声明合同（{str(error)}）。"
+                    "请按 input_contract 只提交允许字段并补齐 required 字段后重试。"
+                ),
+                "input_contract": contract,
+            },
+            ensure_ascii=False,
+        )
 
     async def _resolve_superuser_integration_identity(
         self,
@@ -258,6 +287,17 @@ class MoviePilotApiTool(MoviePilotTool):
                 ensure_ascii=False,
             )
         try:
+            arguments: dict[str, Any] = {"operation_id": operation_id}
+            if path_params is not None:
+                arguments["path_params"] = path_params
+            if query is not None:
+                arguments["query"] = query
+            if body is not None:
+                arguments["body"] = body
+            self.canonical_arguments(arguments)
+        except (TypeError, ValueError) as error:
+            return self._invalid_input_result(operation_id, error)
+        try:
             requires_system_admin = spec.required_role is PrincipalRole.SYSTEM_ADMIN
             executor, is_admin = await self._get_executor(
                 require_system_admin=requires_system_admin,
@@ -271,19 +311,44 @@ class MoviePilotApiTool(MoviePilotTool):
                     },
                     ensure_ascii=False,
                 )
-            return await executor.execute(
+            result = await executor.execute(
                 operation_id,
                 path_params=path_params,
                 query=query,
                 body=body,
             )
+            try:
+                payload = json.loads(result)
+            except (TypeError, ValueError):
+                payload = None
+            if (
+                isinstance(payload, dict)
+                and payload.get("error") == "api_error"
+                and payload.get("status_code") in {400, 422}
+            ):
+                payload["operation_id"] = operation_id
+                payload["message"] = (
+                    f"{operation_id} 被 API 拒绝，请根据 input_contract 修正输入后重试。"
+                )
+                payload["input_contract"] = self.get_operation_input_contract(operation_id)
+                result = json.dumps(payload, ensure_ascii=False)
+            if operation_id == "scheduler.run" and inspect_tool_result(result) is ExecutionOutcome.SUCCEEDED:
+                payload = json.loads(result)
+                if isinstance(payload, dict) and payload.get("success") is True:
+                    payload["execution_outcome"] = "pending"
+                    return json.dumps(payload, ensure_ascii=False)
+            return result
         except ApiExecutionError as error:
+            failure: dict[str, Any] = {
+                "success": False,
+                "error": "operation_unavailable",
+                "message": str(error),
+            }
+            if error.external_may_continue:
+                failure["execution_outcome"] = "unknown"
+                failure["message"] += "；操作可能已生效，请先只读核验实际状态，避免重复执行。"
             return json.dumps(
-                {
-                    "success": False,
-                    "error": "operation_unavailable",
-                    "message": str(error),
-                },
+                failure,
                 ensure_ascii=False,
             )
 

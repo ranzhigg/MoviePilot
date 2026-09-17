@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from enum import Enum
+from functools import partial
 from typing import cast
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 
 from app.api.context import (
@@ -25,15 +27,19 @@ from app.application.classification.configuration import (
     ClassificationPolicyNotInitializedError,
     ClassificationPolicyRevisionNotFoundError,
     ClassificationPolicyValidationError,
+    build_default_classification_policy,
 )
 from app.application.classification.contract import (
     ClassificationPolicyConflictError,
     ClassificationPolicyStateCorruptError,
 )
+from app.application.classification.execution import ClassificationExecutionPort
 from app.application.classification.runtime import ClassificationRuntime
 from app.application.history import DownloadHistoryQueryPort
+from app.chain.media import MediaChain
 from app.schemas.category import (
     ClassificationEvaluation,
+    ClassificationFacts,
     ClassificationFieldCatalog,
     ClassificationImpactAnalysis,
     ClassificationImpactRequest,
@@ -48,6 +54,7 @@ from app.schemas.category import (
     ClassificationValidationResult,
 )
 from app.schemas.response import Response
+from app.schemas.types import MediaSource, MediaType
 from app.startup.composition.context import HostRuntime
 
 router = ResponseAPIRouter()
@@ -71,14 +78,66 @@ def _get_analysis_service(
     """组装分类分析服务及其只读近期历史样本端口。"""
     return ClassificationAnalysisService(
         runtime.classification.service,
+        execution=runtime.classification_execution,
         sample_provider=RecentHistoryClassificationSampleProvider(
             download_history=cast(
                 DownloadHistoryQueryPort,
                 runtime.history.download_repository(db),
             ),
             transfer_history=runtime.history.transfer_repository,
+            facts_resolver=partial(
+                _resolve_history_facts,
+                runtime.classification_execution,
+            ),
         ),
     )
+
+
+async def _resolve_history_facts(
+    execution: ClassificationExecutionPort,
+    history: object,
+) -> ClassificationFacts | None:
+    """按历史记录中的来源和编号重新读取完整媒体信息。"""
+    media_source = _enum_text(getattr(history, "media_source", None))
+    media_id = str(getattr(history, "media_id", None) or "").strip()
+    media_type = _history_media_type(getattr(history, "type", None))
+    if not media_source or not media_id or media_type is None:
+        return None
+    try:
+        source = MediaSource(media_source)
+        media = await MediaChain().async_recognize_media(
+            media_source=source,
+            media_id=media_id,
+            mtype=media_type,
+            music_type=str(getattr(history, "music_type", None) or "").strip() or None,
+        )
+        if media is None:
+            return None
+        return await execution.async_build_facts(media)
+    except (TypeError, ValueError):
+        return None
+
+
+def _history_media_type(value: object) -> MediaType | None:
+    """兼容历史记录中的中文和英文媒体类型。"""
+    normalized = _enum_text(value).casefold()
+    aliases = {
+        "电影": MediaType.MOVIE,
+        "movie": MediaType.MOVIE,
+        "电视剧": MediaType.TV,
+        "tv": MediaType.TV,
+        "电视": MediaType.TV,
+        "音乐": MediaType.MUSIC,
+        "music": MediaType.MUSIC,
+    }
+    return aliases.get(normalized)
+
+
+def _enum_text(value: object) -> str:
+    """把枚举或普通值转换为去除首尾空白的文本。"""
+    if isinstance(value, Enum):
+        value = value.value
+    return str(value or "").strip()
 
 
 def _require_active_policy(runtime: ClassificationRuntime) -> ClassificationPolicy:
@@ -141,8 +200,19 @@ def _validation_response(
 async def get_policy(
     _: object = Depends(get_current_active_user_async),
     runtime: ClassificationRuntime = Depends(get_classification_runtime),
+    template: str | None = Query(
+        default=None,
+        description="读取内置分类策略模板时传入 default；省略则读取活动策略",
+    ),
 ) -> ClassificationPolicy:
-    """返回与运行时内部引用隔离的活动策略和 revision。"""
+    """返回活动策略，或返回不写入运行时的内置默认策略草稿。"""
+    if template == "default":
+        return build_default_classification_policy()
+    if template is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="不支持的分类策略模板",
+        )
     return _require_active_policy(runtime)
 
 
@@ -215,13 +285,17 @@ async def validate_policy(
 async def preview_policy(
     request: ClassificationPreviewRequest,
     _: object = Depends(get_current_active_user_async),
-    runtime: ClassificationRuntime = Depends(get_classification_runtime),
+    host_runtime: HostRuntime = Depends(get_host_runtime),
 ) -> ClassificationEvaluation | JSONResponse:
-    """对显式标准事实执行活动策略或未发布草稿并返回完整 trace。"""
+    """对选择的媒体信息或兼容事实执行策略，并返回完整匹配说明。"""
+    runtime = host_runtime.classification
     if request.policy is None:
         _require_active_policy(runtime)
     try:
-        return ClassificationAnalysisService(runtime.service).preview(request)
+        return ClassificationAnalysisService(
+            runtime.service,
+            execution=host_runtime.classification_execution,
+        ).preview(request)
     except ClassificationPolicyValidationError as error:
         return _validation_response(error)
 
@@ -237,7 +311,7 @@ async def analyze_impact(
     _: object = Depends(get_current_active_superuser_async),
     service: ClassificationAnalysisService = Depends(_get_analysis_service),
 ) -> ClassificationImpactAnalysis | JSONResponse:
-    """比较活动策略与草稿；样本有限且不触发联网识别或任何写入。"""
+    """读取近期历史对应的完整媒体详情后比较策略，不修改媒体或历史数据。"""
     try:
         return await service.impact(
             request.policy,

@@ -20,10 +20,11 @@ from app.application.torrent.download import TorrentHelper
 from app.chain._contracts import MusicSubscribeMixinHost
 from app.chain.download import DownloadChain
 from app.chain.media import MediaChain
-from app.chain.search.facade import SearchChain
 from app.domain.context import Context, MediaInfo, MusicInfo
 from app.domain.media import MUSIC_SUBSCRIBABLE_TYPES
 from app.domain.meta.metamusic import MetaMusic
+from app.domain.metainfo import MetaInfo
+from app.domain.music import match_music_resource
 from app.runtime.log import logger
 from app.schemas.category import ClassificationSelection
 from app.schemas.common import JsonData
@@ -113,12 +114,6 @@ def _finalize_music_subscribe_recognition(
 
 
 class MusicSubscribeMixin:
-    __mixin_host_protocol__ = MusicSubscribeMixinHost
-    subscription_repository: SubscriptionRepository
-    sync_subscription_mutation_scope: "SyncSubscriptionMutationScope"
-    _SubscribeChain__candidate_contract_changed: Callable[
-        [SubscriptionSnapshot, SubscriptionSnapshot], bool
-    ]
     """
     音乐订阅功能域 mixin：单曲/专辑目标识别、实体快照同步、候选筛选、
     择优下载与完成推进。
@@ -130,12 +125,19 @@ class MusicSubscribeMixin:
     SubscribeChain 主体形成双向模块依赖。
     """
 
+    __mixin_host_protocol__ = MusicSubscribeMixinHost
+    subscription_repository: SubscriptionRepository
+    sync_subscription_mutation_scope: "SyncSubscriptionMutationScope"
+    _SubscribeChain__candidate_contract_changed: Callable[
+        [SubscriptionSnapshot, SubscriptionSnapshot], bool
+    ]
+
     @staticmethod
     def _validate_music_subscribe_target(
             mediainfo: MediaInfo,
             requested_music_type: Optional[str] = None,
     ) -> Optional[str]:
-        """校验音乐订阅实体一致性，并确保专辑具备可验证的曲目总数。"""
+        """校验音乐订阅实体一致性，并确保专辑具备可累计的曲目总数。"""
         if mediainfo.type != MediaType.MUSIC:
             return "识别结果不是音乐"
         music_type = getattr(mediainfo, "music_type", None)
@@ -147,7 +149,7 @@ class MusicSubscribeMixin:
             return f"音乐订阅类型不匹配：请求 {requested_music_type}，识别为 {music_type}"
         if music_type == MUSIC_ENTITY_ALBUM \
                 and _normalize_music_total_tracks(getattr(mediainfo, "total_tracks", None)) is None:
-            return "专辑总曲目数未知，无法校验整张专辑资源"
+            return "专辑总曲目数未知，无法累计专辑下载进度"
         return None
 
     @staticmethod
@@ -326,13 +328,49 @@ class MusicSubscribeMixin:
             mediainfo: MusicInfo,
             downloads: Optional[List[Context]],
     ) -> bool:
-        """判断音乐下载是否满足订阅完成条件；专辑必须由下载层确认整专曲目覆盖。"""
-        if not downloads:
-            return False
+        """判断音乐下载是否满足订阅完成条件；专辑按累计独立曲目数完成。"""
         music_type = getattr(subscribe, "music_type", None) or mediainfo.music_type
         if music_type != MUSIC_ENTITY_ALBUM:
-            return True
-        return any(context.confirmed_full_coverage for context in downloads)
+            return bool(downloads)
+        total_tracks = _normalize_music_total_tracks(
+            getattr(subscribe, "total_tracks", None) or mediainfo.total_tracks
+        )
+        if total_tracks is None:
+            return False
+        downloaded_tracks = {
+            item
+            for item in (getattr(subscribe, "downloaded_tracks", None) or [])
+            if isinstance(item, str) and item
+        }
+        return len(downloaded_tracks) >= total_tracks
+
+    @staticmethod
+    def _music_downloads_complete_after_merge(
+            subscribe: SubscriptionSnapshot,
+            mediainfo: MusicInfo,
+            downloads: Optional[List[Context]],
+    ) -> bool:
+        """判断本轮下载事实并入订阅后是否达到整专曲目总数。"""
+        music_type = getattr(subscribe, "music_type", None) or mediainfo.music_type
+        if music_type != MUSIC_ENTITY_ALBUM:
+            return bool(downloads)
+        total_tracks = _normalize_music_total_tracks(
+            getattr(subscribe, "total_tracks", None) or mediainfo.total_tracks
+        )
+        if total_tracks is None:
+            return False
+        downloaded_tracks = {
+            item
+            for item in (getattr(subscribe, "downloaded_tracks", None) or [])
+            if isinstance(item, str) and item
+        }
+        for context in downloads or []:
+            downloaded_tracks.update(
+                item
+                for item in (getattr(context, "music_track_keys", None) or [])
+                if isinstance(item, str) and item
+            )
+        return len(downloaded_tracks) >= total_tracks
 
     def _prepare_music_subscribe(
             self,
@@ -376,6 +414,7 @@ class MusicSubscribeMixin:
         default_rule_key = SystemConfigKey.BestVersionFilterRuleGroups \
             if subscribe.best_version else SystemConfigKey.SubscribeFilterRuleGroups
         rule_groups = subscribe.filter_groups or get_configured_system_config().get(default_rule_key) or []
+        custom_words = subscribe.custom_words.split("\n") if subscribe.custom_words else []
         torrent_helper = TorrentHelper()
         matched: List[Context] = []
         for source_context in contexts or []:
@@ -386,11 +425,16 @@ class MusicSubscribeMixin:
             torrent = copy.copy(source_torrent)
             if sites and torrent.site not in sites:
                 continue
-            if not SearchChain.matches_music_resource(
-                    mediainfo,
-                    torrent.title,
-                    torrent.description,
-            ):
+            meta = cast(MetaMusic, MetaInfo(
+                title=torrent.title,
+                subtitle=torrent.description,
+                custom_words=custom_words,
+                mtype=MediaType.MUSIC,
+            ))
+            match = match_music_resource(
+                mediainfo, torrent.title, torrent.description, torrent.category, meta=meta,
+            )
+            if match.status != "exact":
                 continue
             if not torrent_helper.filter_torrent(torrent, self.get_params(subscribe)):
                 continue
@@ -406,9 +450,6 @@ class MusicSubscribeMixin:
 
             context = copy.copy(source_context)
             context.torrent_info = torrent
-            meta = MetaMusic.from_music_info(mediainfo)
-            meta.org_string = torrent.title
-            meta.apply_audio_quality(f"{torrent.title} {torrent.description or ''}", overwrite=True)
             if subscribe.best_version:
                 # 用户规则组可用格式、码率等内置规则定义洗版顺序；未命中规则
                 # 优先级时再回退到规范化音质分数，确保零配置也能自动升级。
@@ -425,6 +466,8 @@ class MusicSubscribeMixin:
             context.match_source = str(mediainfo.media_source or "title")
             context.candidate_recognized = False
             context.media_info_is_target = True
+            context.match_status = "exact"
+            context.match_reason = match.reason
             context.media_info = _apply_music_subscription_classification(
                 context.media_info,
                 subscribe,
@@ -478,10 +521,11 @@ class MusicSubscribeMixin:
         ]
         quality_downloads = successful
         if getattr(subscribe, "music_type", None) == MUSIC_ENTITY_ALBUM:
-            quality_downloads = [
-                context for context in successful
-                if context.confirmed_full_coverage
-            ]
+            quality_downloads = successful if self._music_downloads_complete_after_merge(
+                subscribe,
+                mediainfo,
+                successful,
+            ) else []
         current_subscribe = None
         if subscribe.best_version and quality_downloads:
             best_context = max(quality_downloads, key=lambda item: item.torrent_info.pri_order)
@@ -513,53 +557,8 @@ class MusicSubscribeMixin:
             subscribe: SubscriptionSnapshot,
             execution_context: Optional[SubscriptionExecutionContext] = None,
     ) -> None:
-        """复用站点标题搜索、订阅过滤和批量下载完成单个音乐订阅。"""
-        self._ensure_music_execution_active(execution_context)
-        target = self._prepare_music_subscribe(subscribe)
-        if not target:
-            return
-        subscribe, mediainfo, _ = target
-        self._ensure_music_execution_active(execution_context)
-
-        sites = self.get_sub_sites(subscribe)
-        default_rule_key = SystemConfigKey.BestVersionFilterRuleGroups \
-            if subscribe.best_version else SystemConfigKey.SubscribeFilterRuleGroups
-        rule_groups = subscribe.filter_groups or get_configured_system_config().get(default_rule_key) or []
-        keywords = [subscribe.keyword] if subscribe.keyword else SearchChain.music_site_keywords(mediainfo)
-        if not keywords:
-            keywords = [subscribe.name]
-
-        searchchain = SearchChain()
-        contexts: List[Context] = []
-        if execution_context:
-            execution_context.report_phase("searching")
-        for keyword in keywords:
-            self._ensure_music_execution_active(execution_context)
-            contexts = searchchain.search_by_title(
-                title=keyword,
-                sites=sites,
-                mtype=MediaType.MUSIC,
-                rule_groups=rule_groups,
-            )
-            self._ensure_music_execution_active(execution_context)
-            contexts = self._filter_music_subscribe_contexts(
-                subscribe=subscribe,
-                mediainfo=mediainfo,
-                contexts=contexts,
-            )
-            if contexts:
-                break
-
-        if not contexts:
-            logger.warning(f"音乐订阅 {subscribe.keyword or subscribe.name} 未搜索到符合条件的资源")
-            return
-
-        self._download_music_subscribe(
-            subscribe,
-            mediainfo,
-            contexts,
-            execution_context=execution_context,
-        )
+        """兼容音乐订阅入口，主动搜索、站点预算和结果处理统一由订阅搜索 owner 编排。"""
+        self._process_search_subscription(subscribe, None, execution_context=execution_context)
 
     def _match_music_subscribe(
             self,

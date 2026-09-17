@@ -5,7 +5,7 @@
 长在 SubscribeOper.add 上，但取标题、选海报尺寸、判音乐实体、决定哪几个字段构成一条
 订阅的身份，都是订阅业务的规则而非数据访问——Oper 只该收敛查询，领域对象不该出现在
 它的入参里。搬上来之后 SubscribeOper 收到的是纯粹的持久化字典，与
-app/application/history.py 里整理历史的写入路径同构。
+app/application/history/ 里整理历史的写入路径同构。
 
 留在 Oper 的是列类型强转与建库时间戳：那几步是为 PostgreSQL 的严格类型检查和订阅表
 自己的列类型而存在的，跟着列走比跟着调用方走更不容易漂。
@@ -44,7 +44,7 @@ from app.schemas.types import MUSIC_ENTITY_ALBUM, MediaSource, MediaType
 
 # 身份不完整时的固定返回。身份不全的订阅写进去就是一条永远匹配不上资源的僵尸订阅，
 # 而后续按身份去重也会失效，所以必须在查询与建模之前短路
-INCOMPLETE_IDENTITY = (0, "媒体身份不完整")
+INCOMPLETE_IDENTITY = (0, "未识别到媒体信息，请检查媒体来源和媒体 ID 后重试")
 
 
 class SubscriptionOutboxStager(Protocol):
@@ -404,6 +404,8 @@ def _translate(
             "vote": mediainfo.vote_average,
             "description": mediainfo.overview,
             "music_type": music_type,
+            # 专辑进度从空集合开始累计；单曲不使用专辑曲目事实。
+            "downloaded_tracks": [] if music_type == MUSIC_ENTITY_ALBUM else None,
             # 整专完成判定拿 total_tracks 当分母，单曲带着专辑的曲目数会永远判不到完成
             "total_tracks": getattr(mediainfo, "total_tracks", None) if music_type == MUSIC_ENTITY_ALBUM else None,
         }

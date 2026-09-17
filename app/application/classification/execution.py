@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from enum import Enum
-from typing import Protocol, TypeAlias
+from typing import Final, Protocol, TypeAlias, cast
 
 from app.application.classification.legacy import (
     build_legacy_tmdb_extension_facts,
@@ -16,6 +16,7 @@ from app.domain.classification.facts import build_classification_facts
 from app.domain.context import MediaInfo, MusicAlbumInfo, MusicArtistInfo, MusicInfo
 from app.schemas.category import (
     CategoryConfig,
+    ClassificationEvaluation,
     ClassificationFacts,
     ClassificationFactValue,
     ClassificationPolicy,
@@ -34,6 +35,9 @@ ClassificationExtensionFactsProvider: TypeAlias = Callable[
 ]
 """按当前插件注册表校验并提供来源扩展分类事实的端口。"""
 
+_LEGACY_TMDB_SOURCE: Final[str] = "themoviedb"
+_LEGACY_RULE_PREFIX: Final[str] = "legacy."
+
 
 class ClassificationRuntimePort(Protocol):
     """分类执行只需要的活动策略与 legacy 快照端口。"""
@@ -49,6 +53,22 @@ class ClassificationRuntimePort(Protocol):
 
 class ClassificationExecutionPort(Protocol):
     """Chain、订阅和整理应用层共享的纯分类执行端口。"""
+
+    async def async_build_facts(
+        self,
+        media: ClassificationSubject,
+    ) -> ClassificationFacts | None:
+        """异步构造与实际分类一致的完整事实快照，不写入媒体或策略。"""
+        ...
+
+    def build_facts(
+        self,
+        media: ClassificationSubject,
+        *,
+        policy: ClassificationPolicy | None = None,
+    ) -> ClassificationFacts | None:
+        """同步构造与实际分类一致的完整事实快照，不写入媒体或策略。"""
+        ...
 
     def finalize(
         self,
@@ -117,6 +137,50 @@ class ClassificationExecutionService:
         self._runtime = runtime
         self._extension_facts_provider = extension_facts_provider
         self._enrichment = enrichment
+
+    async def async_build_facts(
+        self,
+        media: ClassificationSubject,
+    ) -> ClassificationFacts | None:
+        """构造影响分析使用的完整事实，并复用插件扩展与跨来源补充规则。"""
+        finalized, policy, facts, _ = self._prepare(
+            media,
+            extensions=None,
+            effective_override=None,
+            refresh=False,
+        )
+        if policy is None or facts is None:
+            return None
+        if self._enrichment is not None:
+            try:
+                facts = await self._enrichment.async_enrich(policy, facts, finalized)
+            except Exception:  # noqa: BLE001  详情补充失败时保留主来源事实
+                pass
+        return facts
+
+    def build_facts(
+        self,
+        media: ClassificationSubject,
+        *,
+        policy: ClassificationPolicy | None = None,
+    ) -> ClassificationFacts | None:
+        """同步构造并按当前策略补充缺失事实，不修改媒体对象。"""
+        finalized, active_policy, facts, _ = self._prepare(
+            media,
+            extensions=None,
+            effective_override=None,
+            refresh=True,
+            policy_override=policy,
+        )
+        if active_policy is None or facts is None:
+            return None
+        policy = policy or active_policy
+        if self._enrichment is not None:
+            try:
+                facts = self._enrichment.enrich(policy, facts, finalized)
+            except Exception:  # noqa: BLE001 详情补充失败时保留主来源事实
+                pass
+        return facts
 
     def finalize(
         self,
@@ -195,6 +259,7 @@ class ClassificationExecutionService:
         extensions: Mapping[str, Mapping[str, ClassificationFactValue]] | None,
         effective_override: ClassificationSelection | None,
         refresh: bool,
+        policy_override: ClassificationPolicy | None = None,
     ) -> tuple[
         ClassificationSubject,
         ClassificationPolicy | None,
@@ -205,7 +270,7 @@ class ClassificationExecutionService:
         del refresh
         effective_override = effective_override or _explicit_effective_override(media)
         finalized = deepcopy(media)
-        policy = self._runtime.active_policy()
+        policy = policy_override or self._runtime.active_policy()
         if policy is None:
             self._apply_invalid_policy_fallback(
                 finalized,
@@ -249,9 +314,12 @@ class ClassificationExecutionService:
         *,
         effective_override: ClassificationSelection | None,
     ) -> ClassificationSubject:
-        """应用纯求值结果和人工覆盖，并更新兼容目录分类。"""
-        evaluation = ClassificationEvaluator.evaluate(policy, facts)
+        """应用纯求值结果、降级保护和人工覆盖，并更新兼容目录分类。"""
+        evaluation = evaluate_classification_facts(policy, facts)
         result = evaluation.result.model_copy(deep=True)
+        carried = _degraded_automatic_selection(finalized, policy, result)
+        if carried is not None:
+            result.effective = carried
         if effective_override:
             result.effective = effective_override.model_copy(deep=True)
         finalized.classification = result
@@ -319,6 +387,110 @@ class ClassificationExecutionService:
             media.set_library_category(_category_path_snapshot(effective))
 
 
+def _evaluate_legacy_tmdb_compatibility(
+    policy: ClassificationPolicy,
+    facts: ClassificationFacts,
+    *,
+    trace: bool = False,
+) -> ClassificationEvaluation | None:
+    """让旧 TMDB 分类规则消费非 TMDB 来源已经拥有的标准事实。"""
+    if facts.identity.media_source == _LEGACY_TMDB_SOURCE:
+        return None
+    legacy_rules = [
+        rule.model_copy(deep=True, update={"sources": []})
+        for rule in policy.rules
+        if rule.id.startswith(_LEGACY_RULE_PREFIX)
+    ]
+    if not legacy_rules:
+        return None
+    compatibility_policy = policy.model_copy(
+        deep=True,
+        update={"rules": legacy_rules},
+    )
+    compatibility_facts = _legacy_tmdb_compatibility_facts(policy, facts)
+    return ClassificationEvaluator.evaluate(
+        compatibility_policy,
+        compatibility_facts,
+        trace=trace,
+    )
+
+
+def _legacy_tmdb_compatibility_facts(
+    policy: ClassificationPolicy,
+    facts: ClassificationFacts,
+) -> ClassificationFacts:
+    """把跨来源标准字段投影到旧规则的 TMDB 扩展命名空间。"""
+    extensions = {
+        str(source): {str(key): value for key, value in values.items()}
+        for source, values in facts.extensions.items()
+    }
+    legacy_info = _legacy_tmdb_info_from_standard_facts(facts)
+    for source, values in build_legacy_tmdb_extension_facts(
+        policy,
+        legacy_info,
+    ).items():
+        target = extensions.setdefault(source, {})
+        for field, value in values.items():
+            target.setdefault(field, value)
+    return cast(
+        ClassificationFacts,
+        facts.model_copy(
+            deep=True,
+            update={"extensions": extensions},
+        ),
+    )
+
+
+def evaluate_classification_facts(
+    policy: ClassificationPolicy,
+    facts: ClassificationFacts,
+    *,
+    trace: bool = False,
+) -> ClassificationEvaluation:
+    """按真实执行路径求值事实，并兼容非 TMDB 来源的旧 TMDB 规则。"""
+    evaluation = ClassificationEvaluator.evaluate(policy, facts, trace=trace)
+    legacy_evaluation = _evaluate_legacy_tmdb_compatibility(policy, facts, trace=trace)
+    if legacy_evaluation is not None and _uses_fallback(evaluation.result):
+        return legacy_evaluation
+    return evaluation
+
+
+def _legacy_tmdb_info_from_standard_facts(
+    facts: ClassificationFacts,
+) -> dict[str, object]:
+    """构造旧规则投影所需的有限 TMDB 字段，不伪造缺失事实。"""
+    media = facts.media
+    info: dict[str, object] = {}
+    if media.language:
+        info["original_language"] = media.language
+    if media.countries:
+        countries = [str(country) for country in media.countries if country]
+        if countries:
+            info["origin_country"] = countries
+            info["production_countries"] = [
+                {"iso_3166_1": country} for country in countries
+            ]
+    if media.year is not None:
+        info["release_date"] = str(media.year)
+    for field in (
+        "adult",
+        "runtime",
+        "content_rating",
+        "companies",
+        "networks",
+    ):
+        value = getattr(media, field, None)
+        if value not in (None, "", []):
+            info[field] = value
+    return info
+
+
+def _uses_fallback(result: ClassificationResult) -> bool:
+    """判断主来源求值是否没有命中具体分类规则。"""
+    selection = result.effective or result.recommended
+    return selection is None or selection.source in {None, "fallback", "source_fallback"}
+
+
 def _classification_extensions(
     policy: ClassificationPolicy,
     media: ClassificationSubject,
@@ -330,7 +502,7 @@ def _classification_extensions(
         for source, values in (supplied or {}).items()
     }
     tmdb_info = getattr(media, "tmdb_info", None)
-    if isinstance(tmdb_info, Mapping):
+    if _enum_text(getattr(media, "media_source", None)) == _LEGACY_TMDB_SOURCE and isinstance(tmdb_info, Mapping):
         for source, values in build_legacy_tmdb_extension_facts(
             policy,
             tmdb_info,
@@ -366,6 +538,38 @@ def _explicit_effective_override(
     if effective is None or effective.source not in {"manual", "subscription"}:
         return None
     return deepcopy(effective)
+
+
+def _degraded_automatic_selection(
+    media: ClassificationSubject,
+    policy: ClassificationPolicy,
+    result: ClassificationResult,
+) -> ClassificationSelection | None:
+    """事实缺失把同策略结果打成兜底时，返回可复用的既有自动分类选择。
+
+    补充元数据的入口会先裁剪媒体字段再重新分类，此时缺失事实只会让结果更差，
+    不会带来新的判断依据。因此仅在既有快照来自同一策略修订且命中过规则，而本次
+    求值同时出现事实缺失和兜底化时才复用；事实读齐后给出的兜底结果仍然生效，
+    策略调整和真正的重新分类不会被掩盖。
+    """
+    if result.state != "partial":
+        return None
+    proposed = result.effective or result.recommended
+    if proposed is not None and proposed.source != "fallback":
+        return None
+    carried = getattr(media, "classification", None)
+    if not isinstance(carried, ClassificationResult):
+        return None
+    if carried.policy_revision != policy.revision:
+        return None
+    if carried.state not in {"complete", "partial"}:
+        return None
+    selection = carried.effective or carried.recommended
+    if selection is None or selection.source != "automatic":
+        return None
+    if not str(selection.category_id or "").strip():
+        return None
+    return cast(ClassificationSelection, selection.model_copy(deep=True))
 
 
 def _enum_text(value: object) -> str:

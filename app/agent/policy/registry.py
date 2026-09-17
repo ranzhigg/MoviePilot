@@ -19,7 +19,10 @@ SAFE_READ_TOOL_NAMES: frozenset[str] = frozenset()
 
 def requests_system_setting_secrets(arguments: Mapping[str, Any]) -> bool:
     """判断结构化 API 参数是否请求读取未脱敏系统设置。"""
-    if str(arguments.get("operation_id") or "") != "config.system.get":
+    if str(arguments.get("operation_id") or "") not in {
+        "config.system.get",
+        "config.system.describe",
+    }:
         return False
     for location in ("body", "query"):
         values = arguments.get(location)
@@ -44,6 +47,7 @@ BUILTIN_LEGACY_SHADOW_INVENTORY = frozenset(
         "send_local_file",
         "send_message",
         "send_voice_message",
+        "view_image",
         "persona",
         "write_file",
         "moviepilot_api",

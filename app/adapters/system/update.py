@@ -4,20 +4,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import shutil
 import stat
 import subprocess
 import threading
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory
 from typing import Any, cast
 
 from app.adapters.network.http import RequestUtils
 from app.adapters.system.resource import ResourceHelper, get_resource_versions
-from app.foundation.environment import is_docker
+from app.foundation.environment import is_docker, is_exe
 from app.foundation.singleton import SingletonClass
 from app.foundation.version import compare_version
+from app.runtime.dependencies.profile import runtime_sync_arguments
 from app.runtime.log import logger
 from app.runtime.settings import get_runtime_setting
 from app.runtime.thread import ThreadHelper
@@ -79,7 +83,7 @@ class SystemUpdateManager(metaclass=SingletonClass):
 
     @property
     def _install_file(self) -> Path:
-        """返回启动器消费的安装意图文件路径。"""
+        """返回 Docker root worker 或本地 CLI 消费的安装意图文件路径。"""
         return self._root / "install.json"
 
     @property
@@ -96,6 +100,33 @@ class SystemUpdateManager(metaclass=SingletonClass):
     def _resource_dir(self) -> Path:
         """返回站点资源包暂存目录。"""
         return self._root / "resources"
+
+    @property
+    def _docker_app_dir(self) -> Path:
+        """返回 Docker 当前后端源码目录。"""
+        return Path(get_runtime_setting("ROOT_PATH"))
+
+    @property
+    def _docker_public_dir(self) -> Path:
+        """返回 Docker 当前前端静态文件目录。"""
+        return Path(get_runtime_setting("FRONTEND_PATH"))
+
+    @property
+    def _docker_pending_file(self) -> Path:
+        """返回 Docker 载荷切换事务标记路径。"""
+        return Path(get_runtime_setting("TEMP_PATH")) / "__update_pending__"
+
+    @property
+    def _docker_previous_app_dir(self) -> Path:
+        """返回 Docker 更新前后端源码备份目录。"""
+        app_dir = self._docker_app_dir
+        return app_dir.with_name(f"{app_dir.name}.__update_previous__")
+
+    @property
+    def _docker_previous_public_dir(self) -> Path:
+        """返回 Docker 更新前前端静态文件备份目录。"""
+        public_dir = self._docker_public_dir
+        return public_dir.with_name(f"{public_dir.name}.__update_previous__")
 
     @staticmethod
     def _now() -> str:
@@ -204,12 +235,14 @@ class SystemUpdateManager(metaclass=SingletonClass):
         return next(item for item in state["updates"] if item["type"] == target)
 
     def _sync_aggregate(self, state: dict[str, Any]) -> dict[str, Any]:
-        """从两类明细重新计算旧版顶层字段和汇总进度。"""
+        """从两类明细重新计算旧版顶层字段、当前版本和汇总进度。"""
         application = self._get_item(state, _APPLICATION)
+        current_version = get_app_version()
+        application["current_version"] = current_version
         state.update(
             {
                 "state": application.get("state", "idle"),
-                "current_version": get_app_version(),
+                "current_version": current_version,
                 "version": application.get("version"),
                 "frontend_version": application.get("frontend_version"),
                 "release_name": application.get("release_name"),
@@ -261,7 +294,7 @@ class SystemUpdateManager(metaclass=SingletonClass):
         return min(100, int(downloaded_value * 100 / total_value))
 
     def get_status(self) -> SystemUpdateStatus:
-        """返回状态快照，并在新进程中收敛已完成的安装状态。"""
+        """收敛安装状态并返回快照；提醒开关实时读取，避免缓存绕过关闭设置。"""
         with self._lock:
             state = self._read_state()
             changed = False
@@ -286,6 +319,15 @@ class SystemUpdateManager(metaclass=SingletonClass):
                 elif item.get("state") == "installing" and self._is_install_applied(item, target):
                     self._reset_item_after_install(item)
                     changed = True
+                elif (
+                    target == _RESOURCES
+                    and item.get("state") == "ready"
+                    and self._is_install_applied(item, target)
+                ):
+                    # 容器替换或手工安装可能先让运行资源达到目标版本，需丢弃残留待安装包。
+                    self._discard_prepared_target(target)
+                    self._reset_item_after_install(item)
+                    changed = True
             resources_changed = (
                 previous_auth_version != auth_version
                 or previous_indexer_version != indexer_version
@@ -294,6 +336,8 @@ class SystemUpdateManager(metaclass=SingletonClass):
                 state = self._persist_state(self._sync_aggregate(state))
             else:
                 state = self._sync_aggregate(state)
+            state["auto_update"] = get_runtime_setting("MOVIEPILOT_AUTO_UPDATE") is True
+            state["auto_update_resource"] = get_runtime_setting("AUTO_UPDATE_RESOURCE") is True
             return cast(SystemUpdateStatus, SystemUpdateStatus.model_validate(state))
 
     def _is_install_applied(self, item: dict[str, Any], target: SystemUpdateType) -> bool:
@@ -333,6 +377,16 @@ class SystemUpdateManager(metaclass=SingletonClass):
                 "can_install": False,
             }
         )
+
+    def check_scheduled(self) -> SystemUpdateStatus:
+        """按实时开关分别检查主程序和资源，避免热重载前的排队任务越过关闭设置。"""
+        for target, setting in (
+            (_APPLICATION, "MOVIEPILOT_AUTO_UPDATE"),
+            (_RESOURCES, "AUTO_UPDATE_RESOURCE"),
+        ):
+            if get_runtime_setting(setting) is True:
+                self.check(target)
+        return self.get_status()
 
     def check(self, target: SystemUpdateType | None = None) -> SystemUpdateStatus:
         """检查主程序和站点资源更新，定时检查失败只记录在对应明细中。"""
@@ -495,10 +549,11 @@ class SystemUpdateManager(metaclass=SingletonClass):
             return self.get_status()
 
     def request_install(self, target: SystemUpdateType = _APPLICATION) -> tuple[bool, str]:
-        """校验指定待安装制品，并写入启动阶段消费的安装意图。"""
+        """校验指定待安装制品，并写入 Docker worker 消费的安装意图。"""
         if target not in _TARGETS:
             return False, f"未知升级类型：{target}"
         with self._lock:
+            temporary: Path | None = None
             state = self.get_status()
             item = self._get_item(state.model_dump(), target)
             if item["state"] != "ready":
@@ -506,7 +561,8 @@ class SystemUpdateManager(metaclass=SingletonClass):
             try:
                 prepared = self._read_prepared_manifest()
                 if target == _APPLICATION:
-                    self._validate_application_manifest(prepared)
+                    if not is_exe():
+                        self._validate_application_manifest(prepared)
                     message = "主程序更新包已就绪，正在重启安装"
                 else:
                     self._validate_resource_manifest(prepared)
@@ -520,14 +576,523 @@ class SystemUpdateManager(metaclass=SingletonClass):
                 if target not in targets:
                     targets.append(target)
                 prepared["targets"] = targets
-                self._install_file.write_text(
+                self._install_file.parent.mkdir(parents=True, exist_ok=True)
+                temporary = self._install_file.with_suffix(f".tmp.{os.getpid()}")
+                temporary.write_text(
                     json.dumps(prepared, ensure_ascii=False, indent=2), encoding="utf-8"
                 )
+                temporary.replace(self._install_file)
                 self._write_item(target, state="installing", can_install=False, error=None)
                 return True, message
             except (OSError, RuntimeError, json.JSONDecodeError) as error:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
                 self._write_item(target, state="failed", error=str(error), can_install=False)
                 return False, str(error)
+
+    def apply_prepared_update(self) -> tuple[bool, str]:
+        """由 Docker root 更新 worker 将已确认制品替换到当前运行目录。"""
+        if not is_docker():
+            return False, "当前运行环境不是 Docker"
+
+        targets: set[SystemUpdateType] = set()
+        with self._lock:
+            try:
+                prepared = self._read_install_manifest()
+                targets = self._prepared_targets(prepared)
+                if not targets:
+                    raise RuntimeError("更新清单缺少可安装目标")
+                if _APPLICATION in targets:
+                    self._validate_application_manifest(prepared)
+                    version = str(prepared.get("version") or "")
+                    frontend_version = str(prepared.get("frontend_version") or "")
+                    if self._validate_backend_archive(version) != frontend_version:
+                        raise RuntimeError("后端更新包声明的前端版本不匹配")
+                    self._validate_frontend_archive(frontend_version)
+                if _RESOURCES in targets:
+                    self._validate_resource_manifest(prepared)
+
+                if _APPLICATION in targets:
+                    self._apply_docker_application(
+                        prepared,
+                        include_resources=_RESOURCES in targets,
+                    )
+                elif _RESOURCES in targets:
+                    self._apply_docker_resources(prepared)
+
+                try:
+                    for target in (_APPLICATION, _RESOURCES):
+                        if target in targets:
+                            self._consume_prepared_target(target)
+                except (OSError, RuntimeError, ValueError) as error:
+                    # 载荷已经替换成功，清单清理失败不能阻止 worker 通知入口重启。
+                    logger.warning(f"更新载荷已替换，但清理下载清单失败：{error}")
+                try:
+                    self._install_file.unlink(missing_ok=True)
+                except OSError as error:
+                    logger.warning(f"清理 Docker 更新安装清单失败：{error}")
+                return True, "已下载的更新已替换到 Docker 程序目录"
+            except (OSError, RuntimeError, ValueError, zipfile.BadZipFile) as error:
+                message = f"Docker 更新包替换失败：{error}"
+                self._mark_install_failed(targets, message)
+                logger.error(message)
+                return False, message
+
+    def _read_install_manifest(self) -> dict[str, Any]:
+        """读取必须存在的 Docker 更新安装清单。"""
+        payload = json.loads(self._install_file.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise RuntimeError("更新安装清单格式无效")
+        return payload
+
+    @staticmethod
+    def _prepared_targets(prepared: dict[str, Any]) -> set[SystemUpdateType]:
+        """解析更新清单中的主程序和站点资源安装目标。"""
+        raw_targets = prepared.get("targets")
+        if raw_targets is not None and not isinstance(raw_targets, list):
+            raise RuntimeError("更新清单目标格式无效")
+        if isinstance(raw_targets, list) and any(
+            not isinstance(target, str) or target not in _TARGETS
+            for target in raw_targets
+        ):
+            raise RuntimeError("更新清单包含未知安装目标")
+        targets = {
+            cast(SystemUpdateType, target)
+            for target in raw_targets or []
+        }
+        if not targets and prepared.get("backend_archive"):
+            targets.add(_APPLICATION)
+        return targets
+
+    def _mark_install_failed(
+        self, targets: set[SystemUpdateType], message: str
+    ) -> None:
+        """记录 Docker 更新失败并撤销本次安装意图，保留下载包供重试。"""
+        try:
+            self._install_file.unlink(missing_ok=True)
+        except OSError as error:
+            logger.warning(f"清理 Docker 更新安装清单失败：{error}")
+        if not targets:
+            try:
+                state = self._read_state()
+                targets = {
+                    cast(SystemUpdateType, item["type"])
+                    for item in state.get("updates", [])
+                    if item.get("state") == "installing" and item.get("type") in _TARGETS
+                }
+            except Exception as error:  # noqa: BLE001  失败路径只记录，不能遮蔽原始错误
+                logger.warning(f"读取待安装更新状态失败：{error}")
+        for target in targets:
+            try:
+                self._write_item(
+                    target,
+                    state="failed",
+                    error=message,
+                    can_update=True,
+                    can_install=False,
+                )
+            except Exception as error:  # noqa: BLE001  失败路径不得遮蔽原始安装错误
+                logger.error(f"记录 {target} 更新失败状态失败：{error}")
+
+    def _consume_prepared_target(self, target: SystemUpdateType) -> None:
+        """从持久化下载清单移除已替换目标，保留另一类下载制品。"""
+        prepared = self._read_prepared_manifest_optional()
+        if target == _APPLICATION:
+            for key in (
+                "version",
+                "frontend_version",
+                "backend_archive",
+                "frontend_archive",
+                "backend_sha256",
+                "frontend_sha256",
+            ):
+                prepared.pop(key, None)
+        elif target == _RESOURCES:
+            for key in ("resource_package_version", "resource_files"):
+                prepared.pop(key, None)
+        else:
+            raise ValueError(f"未知升级类型：{target}")
+
+        targets = [
+            value
+            for value in prepared.get("targets", [])
+            if value in _TARGETS and value != target
+        ]
+        if targets:
+            prepared["targets"] = targets
+        else:
+            prepared.pop("targets", None)
+
+        prepared_file = self._root / "prepared.json"
+        if prepared.get("backend_archive") or prepared.get("resource_files"):
+            temporary = prepared_file.with_suffix(f".tmp.{os.getpid()}")
+            temporary.write_text(
+                json.dumps(prepared, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            temporary.replace(prepared_file)
+        else:
+            prepared_file.unlink(missing_ok=True)
+
+    def _set_docker_pending(self, state: str) -> None:
+        """原子写入 Docker 载荷切换状态，供入口脚本在异常重启时恢复。"""
+        self._docker_pending_file.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._docker_pending_file.with_suffix(f".tmp.{os.getpid()}")
+        temporary.write_text(f"{state}\n", encoding="utf-8")
+        temporary.replace(self._docker_pending_file)
+
+    def _clear_docker_pending(self) -> None:
+        """清除已经提交完成的 Docker 载荷切换状态。"""
+        self._docker_pending_file.unlink(missing_ok=True)
+
+    @staticmethod
+    def _setting_text(key: str, default: str = "") -> str:
+        """读取更新 worker 所需的运行配置，并兼容独立 root 子进程环境。"""
+        try:
+            value = get_runtime_setting(key)
+        except AttributeError:
+            value = None
+        return str(value or os.getenv(key, default) or default).strip()
+
+    def _sync_docker_dependencies(self, project_dir: Path, *, force: bool = False) -> bool:
+        """按新后端清单同步 Docker 共享虚拟环境依赖。"""
+        current_dir = self._docker_app_dir
+        if not force and all(
+            (current_dir / name).read_bytes() == (project_dir / name).read_bytes()
+            for name in ("pyproject.toml", "uv.lock")
+        ):
+            return False
+
+        venv_path = self._setting_text("VENV_PATH", "/opt/venv")
+        uv_bin = self._setting_text("UV_BIN", "/usr/local/bin/uv")
+        command = [
+            uv_bin,
+            "sync",
+            "--project",
+            str(project_dir),
+            "--locked",
+            "--inexact",
+            "--no-dev",
+            "--no-install-project",
+            "--python",
+            f"{venv_path}/bin/python3",
+            *runtime_sync_arguments(),
+        ]
+        package_index = self._setting_text("PIP_PROXY")
+        if package_index:
+            command.extend(("--default-index", package_index))
+        environment = os.environ.copy()
+        proxy = self._setting_text("PROXY_HOST")
+        if proxy:
+            for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+                environment[key] = proxy
+        environment.update(
+            {
+                "UV_PROJECT_ENVIRONMENT": venv_path,
+                "UV_LINK_MODE": "copy",
+            }
+        )
+        try:
+            result = subprocess.run(
+                command,
+                cwd=str(project_dir),
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as error:
+            raise RuntimeError(f"依赖同步执行失败：{error}") from error
+        if result.returncode != 0:
+            raise RuntimeError(f"依赖同步失败，退出码：{result.returncode}")
+        return True
+
+    def _extract_backend_archive(self, archive_path: Path, destination: Path) -> Path:
+        """安全解压后端 Release，并返回唯一的源码根目录。"""
+        with zipfile.ZipFile(archive_path) as archive:
+            self._validate_zip_members(archive)
+            roots = {
+                PurePosixPath(name).parts[0]
+                for name in archive.namelist()
+                if PurePosixPath(name).parts
+            }
+            if len(roots) != 1:
+                raise RuntimeError("后端更新包源码根目录无效")
+            archive.extractall(destination)
+            source_root = destination / next(iter(roots))
+        if not source_root.is_dir():
+            raise RuntimeError("后端更新包源码目录不存在")
+        return source_root
+
+    def _extract_frontend_archive(self, archive_path: Path, destination: Path) -> Path:
+        """安全解压前端 dist.zip，并返回静态文件目录。"""
+        with zipfile.ZipFile(archive_path) as archive:
+            self._validate_zip_members(archive)
+            archive.extractall(destination)
+        frontend_dir = destination / "dist"
+        if not frontend_dir.is_dir():
+            raise RuntimeError("前端更新包缺少 dist 目录")
+        return frontend_dir
+
+    @staticmethod
+    def _remove_path(path: Path) -> None:
+        """删除 Docker 更新事务中的文件或目录。"""
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        elif path.exists() or path.is_symlink():
+            path.unlink()
+
+    @staticmethod
+    def _preserve_tree_ownership(source: Path, destination: Path) -> None:
+        """复制运行时目录后恢复原目录的所有者，避免插件变成 root 不可写。"""
+        source_paths = (source, *source.rglob("*"))
+        for source_path in source_paths:
+            destination_path = destination / source_path.relative_to(source)
+            source_stat = source_path.lstat()
+            os.chown(
+                destination_path,
+                source_stat.st_uid,
+                source_stat.st_gid,
+                follow_symlinks=False,
+            )
+
+    def _copy_plugin_runtime_payload(self, source: Path, destination: Path) -> None:
+        """
+        迁移插件运行时内容，但保留新版宿主的包根入口。
+
+        ``app/plugins/__init__.py`` 属于后端源码提供的兼容入口，不属于持久化插件；
+        旧版本该文件包含宿主实现，随插件目录迁移会遮蔽新版 SDK 的兼容符号。
+        """
+        destination.mkdir(parents=True, exist_ok=True)
+        for destination_path in destination.iterdir():
+            if destination_path.name != "__init__.py":
+                self._remove_path(destination_path)
+
+        for source_path in source.iterdir():
+            if source_path.name == "__init__.py":
+                continue
+            destination_path = destination / source_path.name
+            if source_path.is_dir() and not source_path.is_symlink():
+                shutil.copytree(source_path, destination_path, symlinks=True)
+            else:
+                shutil.copy2(source_path, destination_path, follow_symlinks=False)
+            self._preserve_tree_ownership(source_path, destination_path)
+
+    @staticmethod
+    def _clear_staged_native_resources(resource_dir: Path) -> None:
+        """清除暂存目录中的旧平台原生站点资源。"""
+        if not resource_dir.is_dir():
+            return
+        for path in resource_dir.iterdir():
+            if path.is_file() and path.name.startswith("sites.") and path.suffix in {
+                ".so",
+                ".pyd",
+                ".dylib",
+            }:
+                path.unlink()
+
+    def _resource_source_dir(self, app_dir: Path) -> Path:
+        """定位当前后端携带的站点资源目录，并兼容历史目录。"""
+        resource_dir = app_dir / "app" / "application" / "site"
+        for legacy_dir in (
+            app_dir / "app" / "infrastructure",
+            app_dir / "app" / "adapters" / "network",
+            app_dir / "app" / "helper",
+        ):
+            if not resource_dir.is_dir() and legacy_dir.is_dir():
+                resource_dir = legacy_dir
+        return resource_dir
+
+    @staticmethod
+    def _is_site_runtime_resource(path: Path) -> bool:
+        """判断文件是否属于需要跨 Docker 应用升级继承的站点运行时资源。"""
+        return path.is_file() and (
+            (path.name.startswith("user.sites.") and path.suffix == ".bin")
+            or (
+                path.name.startswith("sites.")
+                and path.suffix in {".so", ".pyd", ".dylib"}
+            )
+        )
+
+    def _copy_site_runtime_resources(
+        self, source_dir: Path, destination_dir: Path
+    ) -> None:
+        """只把旧版本的站点索引和原生资源叠加到新版源码目录。"""
+        if not source_dir.is_dir():
+            return
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        for path in source_dir.iterdir():
+            if self._is_site_runtime_resource(path):
+                shutil.copy2(path, destination_dir / path.name)
+
+    def _copy_prepared_resources(
+        self, prepared: dict[str, Any], resource_dir: Path
+    ) -> None:
+        """把已校验的完整站点资源包复制到指定源码目录。"""
+        self._clear_staged_native_resources(resource_dir)
+        for item in prepared.get("resource_files", []):
+            name = Path(str(item.get("name") or ""))
+            if name.name != str(name):
+                raise RuntimeError("站点资源文件名不安全")
+            shutil.copy2(str(item["path"]), resource_dir / name)
+
+    def _prepare_docker_application(
+        self,
+        prepared: dict[str, Any],
+        temporary_root: Path,
+        *,
+        include_resources: bool,
+    ) -> tuple[Path, Path]:
+        """
+        解压并组装待切换的 Docker 后端、前端和插件资源载荷。
+
+        新版本归档是 Python 源码的唯一来源，旧版本目录只迁移插件和站点运行时内容，
+        不覆盖新版的插件包根兼容入口或新增应用模块。
+        """
+        backend_extract = temporary_root / "backend"
+        frontend_extract = temporary_root / "frontend"
+        backend_extract.mkdir()
+        frontend_extract.mkdir()
+        source_app = self._extract_backend_archive(
+            Path(str(prepared["backend_archive"])), backend_extract
+        )
+        source_public = self._extract_frontend_archive(
+            Path(str(prepared["frontend_archive"])), frontend_extract
+        )
+        stage_app = temporary_root / "App"
+        stage_public = temporary_root / "public"
+        source_app.replace(stage_app)
+        source_public.replace(stage_public)
+
+        current_app = self._docker_app_dir
+        current_plugins = current_app / "app" / "plugins"
+        stage_plugins = stage_app / "app" / "plugins"
+        if stage_plugins.is_symlink():
+            self._remove_path(stage_plugins)
+        if stage_plugins.exists() and not stage_plugins.is_dir():
+            raise RuntimeError("插件运行目录不是目录")
+        stage_plugins.mkdir(parents=True, exist_ok=True)
+        if current_plugins.is_dir():
+            self._copy_plugin_runtime_payload(current_plugins, stage_plugins)
+        if not (stage_plugins / "__init__.py").is_file():
+            raise RuntimeError("插件运行目录缺少 app.plugins 兼容入口")
+
+        stage_resources = stage_app / "app" / "application" / "site"
+        current_resources = self._resource_source_dir(current_app)
+        self._copy_site_runtime_resources(current_resources, stage_resources)
+        if include_resources:
+            self._copy_prepared_resources(prepared, stage_resources)
+        return stage_app, stage_public
+
+    def _restore_docker_payload(self) -> None:
+        """在 Docker 载荷切换失败时恢复更新前的源码和前端目录。"""
+        for current, previous in (
+            (self._docker_app_dir, self._docker_previous_app_dir),
+            (self._docker_public_dir, self._docker_previous_public_dir),
+        ):
+            if not previous.exists():
+                continue
+            if current.exists() or current.is_symlink():
+                self._remove_path(current)
+            previous.replace(current)
+
+    def _apply_docker_application(
+        self, prepared: dict[str, Any], *, include_resources: bool
+    ) -> None:
+        """原子替换 Docker 后端源码和前端静态目录，并同步依赖。"""
+        app_dir = self._docker_app_dir
+        public_dir = self._docker_public_dir
+        previous_app = self._docker_previous_app_dir
+        previous_public = self._docker_previous_public_dir
+        if not app_dir.is_dir() or not public_dir.is_dir():
+            raise RuntimeError("Docker 当前程序目录不完整")
+        if previous_app.exists() or previous_public.exists():
+            raise RuntimeError("存在未完成的 Docker 更新事务")
+
+        with TemporaryDirectory(prefix=".moviepilot-update-", dir=str(app_dir.parent)) as temp:
+            temporary_root = Path(temp)
+            stage_app, stage_public = self._prepare_docker_application(
+                prepared,
+                temporary_root,
+                include_resources=include_resources,
+            )
+            dependencies_changed = any(
+                (app_dir / name).read_bytes() != (stage_app / name).read_bytes()
+                for name in ("pyproject.toml", "uv.lock")
+            )
+            dependency_sync_started = False
+            self._set_docker_pending("prepared")
+            try:
+                if dependencies_changed:
+                    self._set_docker_pending("dependencies")
+                    dependency_sync_started = True
+                    self._sync_docker_dependencies(stage_app)
+                self._set_docker_pending("prepared")
+                app_dir.replace(previous_app)
+                try:
+                    public_dir.replace(previous_public)
+                    stage_app.replace(app_dir)
+                    stage_public.replace(public_dir)
+                except OSError:
+                    self._restore_docker_payload()
+                    raise
+                self._set_docker_pending("committed")
+            except Exception:
+                rollback_failed = False
+                try:
+                    self._restore_docker_payload()
+                except OSError as error:
+                    logger.error(f"Docker 更新回滚失败：{error}")
+                    rollback_failed = True
+                if dependency_sync_started:
+                    try:
+                        self._set_docker_pending("dependencies")
+                        self._sync_docker_dependencies(app_dir, force=True)
+                    except (OSError, RuntimeError) as error:
+                        logger.error(f"Docker 更新依赖回滚失败：{error}")
+                        rollback_failed = True
+                if rollback_failed:
+                    raise
+                try:
+                    self._clear_docker_pending()
+                except OSError as error:
+                    logger.error(f"清理 Docker 更新事务标记失败：{error}")
+                    raise
+                raise
+
+        try:
+            self._remove_path(previous_app)
+            self._remove_path(previous_public)
+            self._clear_docker_pending()
+        except OSError as error:
+            logger.warning(f"Docker 更新已完成但旧载荷清理失败：{error}")
+
+    def _apply_docker_resources(self, prepared: dict[str, Any]) -> None:
+        """备份并替换 Docker 站点资源，失败时恢复旧目录。"""
+        resource_dir = self._resource_source_dir(self._docker_app_dir)
+        resource_dir.parent.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(
+            prefix=".moviepilot-resource-update-", dir=str(resource_dir.parent)
+        ) as temp:
+            stage_dir = Path(temp) / "site"
+            if resource_dir.is_dir():
+                shutil.copytree(resource_dir, stage_dir, symlinks=True)
+            else:
+                stage_dir.mkdir()
+            self._copy_prepared_resources(prepared, stage_dir)
+            backup_dir = resource_dir.with_name(f"{resource_dir.name}.__prepared_previous__")
+            self._remove_path(backup_dir)
+            if resource_dir.exists() or resource_dir.is_symlink():
+                # OverlayFS 下镜像层目录不能直接重命名，先复制完整备份再移除。
+                shutil.copytree(resource_dir, backup_dir, symlinks=True)
+            try:
+                self._remove_path(resource_dir)
+                stage_dir.replace(resource_dir)
+            except OSError:
+                if backup_dir.exists():
+                    self._remove_path(resource_dir)
+                    backup_dir.replace(resource_dir)
+                raise
+            self._remove_path(backup_dir)
 
     def cancel_install(self, reason: str) -> None:
         """重启请求失败时撤销全部已选安装意图，避免下次普通启动意外安装。"""
@@ -557,7 +1122,10 @@ class SystemUpdateManager(metaclass=SingletonClass):
         """在后台线程中下载并校验指定升级类型的制品。"""
         try:
             if target == _APPLICATION:
-                self._download_application()
+                if is_exe():
+                    self._simulate_application_download()
+                else:
+                    self._download_application()
             else:
                 self._download_resources()
         except Exception as error:  # noqa: BLE001  后台线程必须沉淀为可查询失败
@@ -567,6 +1135,35 @@ class SystemUpdateManager(metaclass=SingletonClass):
             with self._lock:
                 self._download_active = False
                 self._active_target = None
+
+    def _simulate_application_download(self) -> None:
+        """exe 部署下模拟主程序下载，直接写入准备清单并反馈完成。"""
+        if get_runtime_setting("MOVIEPILOT_AUTO_UPDATE") is not True:
+            raise RuntimeError("请先在高级设置里启用自动检查版本更新")
+        target_item = self._get_item(self._read_state(), _APPLICATION)
+        version = str(target_item.get("version") or "")
+        if not version:
+            raise RuntimeError("主程序更新缺少目标版本")
+        self._merge_prepared_manifest(
+            {
+                "version": version,
+                "frontend_version": version,
+                "backend_archive": str(self._backend_archive),
+                "frontend_archive": str(self._frontend_archive),
+                "backend_sha256": "",
+                "frontend_sha256": "",
+                "prepared_at": self._now(),
+            },
+        )
+        self._write_item(
+            _APPLICATION,
+            state="ready",
+            downloaded_bytes=100,
+            total_bytes=100,
+            error=None,
+            can_update=False,
+            can_install=True,
+        )
 
     def _download_application(self) -> None:
         """下载后端 Release 和其 version.py 声明的前端 dist.zip。"""
@@ -762,6 +1359,12 @@ class SystemUpdateManager(metaclass=SingletonClass):
         frontend_archive = Path(str(prepared.get("frontend_archive") or ""))
         if not prepared.get("version") or not prepared.get("frontend_version"):
             raise RuntimeError("主程序更新清单缺少版本信息")
+        for archive, expected in (
+            (backend_archive, self._backend_archive),
+            (frontend_archive, self._frontend_archive),
+        ):
+            if archive.resolve() != expected.resolve():
+                raise RuntimeError("主程序更新包路径不安全")
         if not backend_archive.is_file() or self._sha256(backend_archive) != prepared.get("backend_sha256"):
             raise RuntimeError("后端更新包校验失败")
         if not frontend_archive.is_file() or self._sha256(frontend_archive) != prepared.get("frontend_sha256"):
@@ -776,7 +1379,7 @@ class SystemUpdateManager(metaclass=SingletonClass):
         actual_names = {
             str(item.get("name") or "") for item in files if isinstance(item, dict)
         }
-        if actual_names != expected_names:
+        if len(files) != len(expected_names) or actual_names != expected_names:
             raise RuntimeError("站点资源更新清单不是当前平台的完整资源包")
         root = self._root.resolve()
         for item in files:
@@ -791,20 +1394,27 @@ class SystemUpdateManager(metaclass=SingletonClass):
                 raise RuntimeError(f"站点资源文件校验失败：{item.get('name')}")
 
     def _request(self) -> RequestUtils:
-        """创建访问 GitHub Release 的请求客户端。"""
+        """创建访问 GitHub Release API 的认证请求客户端。"""
         return RequestUtils(
             proxies=get_runtime_setting("PROXY"),
             headers=get_runtime_setting("GITHUB_HEADERS"),
             timeout=60,
         )
 
+    def _download_request(self) -> RequestUtils:
+        """创建公开 GitHub 归档下载客户端，避免认证头传递到 codeload。"""
+        return RequestUtils(
+            proxies=get_runtime_setting("PROXY"),
+            timeout=60,
+        )
+
     def _download_file(
         self, url: str, destination: Path, downloaded_before: int, total_hint: int
     ) -> tuple[int, int]:
-        """流式下载文件并把进度写入当前升级类型。"""
+        """使用公开下载客户端流式下载文件并把进度写入当前升级类型。"""
         temporary = destination.with_suffix(".part")
         temporary.unlink(missing_ok=True)
-        with self._request().get_stream(url) as response:
+        with self._download_request().get_stream(url) as response:
             if response is None or response.status_code != 200:
                 raise RuntimeError(
                     f"下载更新包失败：HTTP {getattr(response, 'status_code', '无响应')}"

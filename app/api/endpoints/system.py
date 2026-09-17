@@ -3,11 +3,12 @@ import io
 import json
 import zipfile
 from datetime import datetime
-from typing import Annotated, Any, Optional, Union
+from typing import Annotated, Any, Optional
+from urllib.parse import urlsplit
 
 import anyio
 import pillow_avif  # noqa: F401  # pylint: disable=unused-import  # AVIF 注册副作用
-from fastapi import Body, Depends, Header, HTTPException, Query, Request, Response
+from fastapi import Body, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
 from app.adapters.web.security.access import verify_apitoken, verify_resource_token, verify_token
@@ -17,6 +18,17 @@ from app.api.dependencies.auth import (
     get_current_active_superuser_async,
     get_current_active_user_async,
 )
+from app.api.endpoints.identifier import router as system_identifiers_router
+from app.api.endpoints.module import router as module_router
+from app.api.endpoints.settings import (
+    catalog_settings,
+    describe_setting,
+    get_setting,
+    query_settings,
+    set_setting,
+    update_settings,
+)
+from app.api.endpoints.settings import router as system_settings_router
 from app.api.principal import ApiPrincipal
 from app.api.response import CompatibleCountParam, CompatiblePageParam, ResponseAPIRouter
 from app.application.backup import DatabaseBackupInProgressError
@@ -27,12 +39,10 @@ from app.application.configuration import (
 from app.application.database import get_database_governance
 from app.application.image import ImageHelper
 from app.application.messaging.message import MessageHelper
-from app.application.module import get_module_manager
 from app.application.network import get_configured_network_test_service
 from app.application.rules import RuleHelper
 from app.application.scheduling import get_scheduler
 from app.application.security.url import SecurityUtils
-from app.application.settings import SystemSettingsService
 from app.application.site.sites import SitesHelper  # pylint: disable=import-error,no-name-in-module
 from app.application.system import LogFileData, LogNotFoundError
 from app.chain.media import MediaChain
@@ -53,7 +63,6 @@ from app.schemas.common import JsonObjectList as _SchemaJsonObjectList
 from app.schemas.common import TimeData as _SchemaTimeData
 from app.schemas.common import ValueData as _SchemaValueData
 from app.schemas.response import Response as _SchemaResponse
-from app.schemas.system import CustomIdentifiersUpdateRequest as _SchemaCustomIdentifiersUpdateRequest
 from app.schemas.system import DatabaseBackupArtifactData as _SchemaDatabaseBackupArtifactData
 from app.schemas.system import DatabaseBackupVerificationData as _SchemaDatabaseBackupVerificationData
 from app.schemas.system import NetTestTarget as _SchemaNetTestTarget
@@ -61,8 +70,6 @@ from app.schemas.system import PluginMarketSyncData as _SchemaPluginMarketSyncDa
 from app.schemas.system import PluginMarketSyncRequest as _SchemaPluginMarketSyncRequest
 from app.schemas.system import RuleTestData as _SchemaRuleTestData
 from app.schemas.system import SystemEnvironmentUpdateData as _SchemaSystemEnvironmentUpdateData
-from app.schemas.system import SystemModuleListData as _SchemaSystemModuleListData
-from app.schemas.system import SystemSettingsUpdateRequest as _SchemaSystemSettingsUpdateRequest
 from app.schemas.system import SystemUpdateRequest as _SchemaSystemUpdateRequest
 from app.schemas.system import SystemUpdateStatus as _SchemaSystemUpdateStatus
 from app.schemas.token import TokenPayload as _SchemaTokenPayload
@@ -70,6 +77,18 @@ from app.schemas.types import SystemConfigKey
 from app.startup.composition.context import HostRuntime
 
 router = ResponseAPIRouter()
+router.routes.extend(system_identifiers_router.routes)
+router.routes.extend(module_router.routes)
+
+# Re-export setting handlers for existing endpoint-level imports and tests.
+__all__ = [
+    "catalog_settings",
+    "describe_setting",
+    "get_setting",
+    "query_settings",
+    "set_setting",
+    "update_settings",
+]
 
 _PUBLIC_SYSTEM_CONFIG_KEYS = {
     item.value: item
@@ -85,6 +104,23 @@ _PUBLIC_SYSTEM_CONFIG_KEYS = {
     )
 }
 _PUBLIC_SETTINGS_KEYS = {"PLUGIN_MARKET"}
+
+
+def _get_image_proxy_allowed_domains() -> set[str]:
+    """返回图片代理允许的域名，并纳入已启用的 Bangumi 图片代理主机。"""
+    runtime_settings = get_runtime_settings()
+    allowed_domains = set(runtime_settings.get("SECURITY_IMAGE_DOMAINS", []))
+    if not runtime_settings.get("BANGUMI_PROXY_ENABLE"):
+        return allowed_domains
+
+    image_proxy = str(runtime_settings.get("BANGUMI_IMAGE_DOMAIN") or "").strip()
+    if not image_proxy:
+        return allowed_domains
+    candidate = image_proxy if "://" in image_proxy else f"https://{image_proxy}"
+    parsed = urlsplit(candidate)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        allowed_domains.add(parsed.netloc)
+    return allowed_domains
 
 
 def _database_backup_artifact_data(artifact: Any) -> _SchemaDatabaseBackupArtifactData:
@@ -156,7 +192,7 @@ async def fetch_image(
         return None
 
     if allowed_domains is None:
-        allowed_domains = set(get_runtime_settings().get("SECURITY_IMAGE_DOMAINS", []))
+        allowed_domains = _get_image_proxy_allowed_domains()
 
     fetch_url = SecurityUtils.strip_url_signature(url)
     # 验证URL安全性
@@ -227,7 +263,7 @@ async def proxy_img(
     """
     图片代理，可选是否使用代理服务器，支持 HTTP 缓存
     """
-    allowed_domains = set(get_runtime_settings().get("SECURITY_IMAGE_DOMAINS", []))
+    allowed_domains = _get_image_proxy_allowed_domains()
     cookies = MediaServerChain().get_image_cookies(server=None, image_url=imgurl) if use_cookies else None
     return await fetch_image(
         url=imgurl,
@@ -289,6 +325,8 @@ def get_global_setting(token: str):
     runtime_settings = get_runtime_settings()
     info = runtime_settings.snapshot(
         include={
+            "BANGUMI_PROXY_ENABLE",
+            "BANGUMI_IMAGE_DOMAIN",
             "TMDB_IMAGE_DOMAIN",
             "GLOBAL_IMAGE_CACHE",
             "WALLPAPER_ROTATION_INTERVAL",
@@ -326,6 +364,8 @@ async def get_user_global_setting(
         include={
             "AI_AGENT_ENABLE",
             "AI_AGENT_HIDE_ENTRY",
+            "BANGUMI_PROXY_ENABLE",
+            "BANGUMI_IMAGE_DOMAIN",
             "LLM_SUPPORT_AUDIO_INPUT",
             "LLM_SUPPORT_AUDIO_OUTPUT",
             "RECOGNIZE_SOURCE",
@@ -587,159 +627,6 @@ async def sync_plugin_market_from_wiki(
 
 
 @router.get(
-    "/setting/{key}",
-    summary="查询系统设置",
-    response_model=_SchemaResponse[_SchemaValueData],
-)
-async def get_setting(key: str, _: ApiPrincipal = Depends(get_current_active_superuser_async)) -> _SchemaResponse:
-    """
-    查询系统设置（仅管理员）
-    """
-    runtime_settings = get_runtime_settings()
-    if runtime_settings.contains(key):
-        value = runtime_settings.get(key)
-    else:
-        value = get_configured_system_config().get(key)
-    return _SchemaResponse(success=True, data={"value": value})
-
-
-@router.post("/setting/{key}", summary="更新系统设置", response_model=_SchemaResponse[None])
-async def set_setting(
-    key: str,
-    value: Annotated[Union[list, dict, bool, int, str] | None, Body()] = None,
-    _: ApiPrincipal = Depends(get_current_active_superuser_async),
-    runtime: HostRuntime = Depends(get_host_runtime),
-):
-    """
-    更新系统设置（仅管理员）
-    """
-    result = await runtime.system.update_setting(key, value)
-    return _SchemaResponse(success=result.success, message=result.message)
-
-
-@router.get(  # type: ignore[misc]
-    "/settings",
-    summary="Discover or read registered system settings",
-    response_model=_SchemaResponse[_SchemaJsonObject],
-)
-async def query_settings(
-    setting_key: Annotated[
-        Optional[str],
-        Query(
-            description=(
-                "Exact setting key. Accepts Settings field names such as APP_DOMAIN or LLM_MODEL, "
-                "SystemConfigKey values or enum names such as Downloaders or MediaServers, and "
-                "aliases that resolve to one unique setting. Omit it to discover settings."
-            )
-        ),
-    ] = None,
-    group: Annotated[
-        Optional[str],
-        Query(
-            description=(
-                "Discovery group used when setting_key is omitted. Supported groups are all, settings, systemconfig, downloaders, "
-                "media_servers, notifications, notification_switches, storages, directories, "
-                "search_sites, subscribe_sites, site_auth, ai_agent, filter_rules, "
-                "subscribe_defaults, plugins, customization, transfer, scraping, and misc."
-            )
-        ),
-    ] = "all",
-    keyword: Annotated[
-        Optional[str],
-        Query(description="Case-insensitive substring used to discover matching keys, groups, or labels."),
-    ] = None,
-    include_values: Annotated[
-        Optional[bool],
-        Query(description="Return full values. Defaults to true for one exact key and false for discovery results."),
-    ] = None,
-    show_secrets: Annotated[
-        bool,
-        Query(description="Return unredacted secret values. Defaults to false and remains confirmation-protected."),
-    ] = False,
-    _: ApiPrincipal = Depends(get_current_active_superuser_async),
-    runtime: HostRuntime = Depends(get_host_runtime),
-) -> _SchemaResponse[Any]:
-    """按登记元数据查询设置，并默认对敏感值递归脱敏。"""
-    try:
-        data = SystemSettingsService(
-            get_runtime_settings(),
-            get_configured_system_config(),
-            runtime.system.publish_config_changed,
-        ).query(
-            setting_key=setting_key,
-            group=group,
-            keyword=keyword,
-            include_values=include_values,
-            show_secrets=show_secrets,
-        )
-    except ValueError as error:
-        return _SchemaResponse(success=False, message=str(error))
-    return _SchemaResponse(success=True, data=data)
-
-
-@router.post(  # type: ignore[misc]
-    "/settings",
-    summary="Update one registered system setting",
-    response_model=_SchemaResponse[_SchemaJsonObject],
-)
-async def update_settings(
-    payload: _SchemaSystemSettingsUpdateRequest,
-    _: ApiPrincipal = Depends(get_current_active_superuser_async),
-    runtime: HostRuntime = Depends(get_host_runtime),
-) -> _SchemaResponse[Any]:
-    """按替换、字典合并或列表项操作更新一个登记设置。"""
-    try:
-        data = await SystemSettingsService(
-            get_runtime_settings(),
-            get_configured_system_config(),
-            runtime.system.publish_config_changed,
-        ).update(**payload.model_dump())
-    except ValueError as error:
-        return _SchemaResponse(success=False, message=str(error))
-    return _SchemaResponse(success=True, message=data.get("message"), data=data)
-
-
-@router.get(  # type: ignore[misc]
-    "/identifiers",
-    summary="查询自定义识别词",
-    response_model=_SchemaResponse[_SchemaJsonObject],
-)
-async def query_custom_identifiers(
-    _: ApiPrincipal = Depends(get_current_active_superuser_async),
-) -> _SchemaResponse[Any]:
-    """返回完整的自定义识别词列表。"""
-    identifiers = get_configured_system_config().get(SystemConfigKey.CustomIdentifiers) or []
-    return _SchemaResponse(
-        success=True,
-        data={"count": len(identifiers), "identifiers": identifiers},
-    )
-
-
-@router.post(  # type: ignore[misc]
-    "/identifiers",
-    summary="更新自定义识别词",
-    response_model=_SchemaResponse[_SchemaJsonObject],
-)
-async def update_custom_identifiers(
-    payload: _SchemaCustomIdentifiersUpdateRequest,
-    _: ApiPrincipal = Depends(get_current_active_superuser_async),
-    runtime: HostRuntime = Depends(get_host_runtime),
-) -> _SchemaResponse[Any]:
-    """完整替换自定义识别词。"""
-    identifiers = [item for item in payload.identifiers if item is not None]
-    data = await SystemSettingsService(
-        get_runtime_settings(),
-        get_configured_system_config(),
-        runtime.system.publish_config_changed,
-    ).update(
-        setting_key=SystemConfigKey.CustomIdentifiers.value,
-        value=identifiers or None,
-    )
-    data.update({"count": len(identifiers), "identifiers": identifiers})
-    return _SchemaResponse(success=True, message=data.get("message"), data=data)
-
-
-@router.get(
     "/message",
     summary="实时消息",
     response_model=None,
@@ -964,7 +851,9 @@ def ruletest(
     summary="获取网络测试目标",
     response_model=_SchemaResponse[list[_SchemaNetTestTarget]],
 )
-async def nettest_targets(_: _SchemaTokenPayload = Depends(verify_token), page: CompatiblePageParam = None, count: CompatibleCountParam = None):
+async def nettest_targets(
+    _: _SchemaTokenPayload = Depends(verify_token), page: CompatiblePageParam = None, count: CompatibleCountParam = None
+):
     """
     获取网络测试目标。
 
@@ -1006,42 +895,6 @@ async def nettest(
         message=result.message,
         data=data,
     )
-
-
-@router.get(
-    "/modulelist",
-    summary="查询已加载的模块ID列表",
-    response_model=_SchemaResponse[_SchemaSystemModuleListData],
-)
-def modulelist(_: _SchemaTokenPayload = Depends(verify_token)):
-    """
-    查询已加载的模块ID列表
-    """
-    modules = []
-    for spec in get_module_manager().list_specs():
-        module_id = spec.id
-        name = str(spec.metadata["name"])
-        modules.append(
-            {
-                "id": module_id,
-                "name": name,
-                "name_i18n": LocaleHelper.translate(
-                    f"system.modules.{module_id}.name",
-                    default=name,
-                ),
-                "name_key": f"system.modules.{module_id}.name",
-            }
-        )
-    return _SchemaResponse(success=True, data={"modules": modules})
-
-
-@router.get("/moduletest/{moduleid}", summary="模块可用性测试", response_model=_SchemaResponse[None])
-def moduletest(moduleid: str, _: _SchemaTokenPayload = Depends(verify_token)):
-    """
-    模块可用性测试接口
-    """
-    state, errmsg = get_module_manager().test(moduleid)
-    return _SchemaResponse(success=state, message=errmsg)
 
 
 @router.get("/restart", summary="重启系统", response_model=_SchemaResponse[None])
@@ -1094,7 +947,9 @@ def check_system_update(
 
 
 @router.post(
-    "/update/download", summary="后台下载系统更新", response_model=_SchemaResponse[_SchemaSystemUpdateStatus],
+    "/update/download",
+    summary="后台下载系统更新",
+    response_model=_SchemaResponse[_SchemaSystemUpdateStatus],
 )
 def download_system_update(
     _: ApiPrincipal = Depends(get_current_active_superuser),
@@ -1107,7 +962,9 @@ def download_system_update(
 
 
 @router.post(
-    "/update/install", summary="确认重启安装系统更新", response_model=_SchemaResponse[None],
+    "/update/install",
+    summary="确认重启安装系统更新",
+    response_model=_SchemaResponse[None],
 )
 def install_system_update(
     _: ApiPrincipal = Depends(get_current_active_superuser),
@@ -1146,3 +1003,7 @@ def run_scheduler2(jobid: str, _: Annotated[str, Depends(verify_apitoken)]):
     else:
         get_scheduler().start(jobid)
     return _SchemaResponse(success=True)
+
+
+# Keep the settings routes in the legacy system router while owning their code separately.
+router.routes.extend(system_settings_router.routes)

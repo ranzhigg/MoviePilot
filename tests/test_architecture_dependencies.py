@@ -81,7 +81,6 @@ RETIRED_CANONICAL_FILES = (
     "app/runtime/native_dependencies.py",
     "app/agent/runtime_loader.py",
     "app/agent/llm/server_tools.py",
-    "app/agent/middleware/activity_log.py",
     "app/agent/middleware/patch_tool_calls.py",
     "app/agent/middleware/runtime_config.py",
     "app/agent/middleware/tool_selection.py",
@@ -392,11 +391,13 @@ def test_domain_classification_is_a_pure_direct_import_package() -> None:
     package = APP_ROOT / "domain" / "classification"
     assert {path.name for path in package.glob("*.py")} == {
         "__init__.py",
+        "conditions.py",
         "evaluator.py",
         "facts.py",
         "fields.py",
         "sources.py",
         "validation.py",
+        "vocabulary.py",
     }
 
     init_path = package / "__init__.py"
@@ -459,6 +460,7 @@ def test_application_classification_uses_same_named_package() -> None:
         "execution.py",
         "legacy.py",
         "migration.py",
+        "compiler.py",
         "projection.py",
         "reference.py",
         "runtime.py",
@@ -803,7 +805,7 @@ def test_startup_composes_typed_chain_and_agent_data_contexts():
 
 def test_download_history_ports_are_typed_detached_and_canonically_injected():
     """下载历史宿主调用面只能消费冻结快照和显式事务 adapter。"""
-    history_path = APP_ROOT / "application" / "history.py"
+    history_path = APP_ROOT / "application" / "history" / "__init__.py"
     history_tree = ast.parse(
         history_path.read_text(encoding="utf-8"),
         filename=str(history_path),
@@ -1206,6 +1208,26 @@ def test_host_uses_canonical_workflow_manager_name():
             violations.append(str(path.relative_to(PROJECT_ROOT)))
 
     assert violations == []
+
+
+def test_plugin_route_refresh_is_imported_from_its_application_owner():
+    """插件路由刷新只有 Application 一个拥有者，端点之间不得互相取用它。"""
+    owner = "app.application.plugin.routes"
+    violations: dict[str, str] = {}
+    for path in APP_ROOT.rglob("*.py"):
+        relative = path.relative_to(APP_ROOT)
+        if relative.parts[0] == "plugins":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.level:
+                continue
+            if node.module == owner:
+                continue
+            if any(alias.name == "register_plugin_api" for alias in node.names):
+                violations[str(relative)] = node.module or ""
+
+    assert violations == {}
 
 
 def test_startup_root_contains_only_composition_packages():

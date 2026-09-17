@@ -3,16 +3,25 @@ import importlib
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
+import app.startup.initializers.plugins as plugins_initializer
 from app.runtime.compat.diagnostics import (
     configure_legacy_import_diagnostics,
     get_legacy_import_diagnostics,
     reset_legacy_import_diagnostics,
     scan_plugin_legacy_imports,
 )
-from app.runtime.compat.imports import install_legacy_import_hook
+from app.runtime.compat.imports import (
+    PLUGINS_PACKAGE_ROOT_BACKUP_SUFFIX,
+    PLUGINS_PACKAGE_ROOT_SOURCE,
+    detect_plugins_package_root_shadowing,
+    detect_shadowed_exports,
+    install_legacy_import_hook,
+    restore_plugins_package_root,
+)
 from app.runtime.compat.manifest import (
     _MESSAGE_NOTIFICATION_SYMBOL_ALIASES,
     MODULE_ALIASES,
@@ -483,6 +492,7 @@ def test_plugin_scan_reports_moved_symbol_import(tmp_path: Path):
 def test_symbol_alias_manifest_covers_all_moved_public_symbols():
     """符号级映射清单应覆盖媒体身份、整理工作项、刮削拆分与消息/通知命名统一的旧入口。"""
     assert set(SYMBOL_ALIASES["app.chain"]) == {"ChainBase"}
+    assert set(SYMBOL_ALIASES["app.plugins"]) == {"PluginChian", "_PluginBase"}
     assert set(SYMBOL_ALIASES["app.db.oper"]) == {
         "SiteOper",
         "SubscribeHistoryOper",
@@ -551,3 +561,182 @@ def test_chain_base_legacy_sdk_and_canonical_imports_share_identity(monkeypatch)
     assert sdk is canonical
     assert legacy_chain.ChainBase._compat_identity_marker is marker
     assert sdk._compat_identity_marker is marker
+
+
+def test_plugin_base_legacy_and_sdk_imports_share_canonical_identity(monkeypatch):
+    """插件安装包根与 SDK 必须解析到同一个契约基类，属性补丁对两条路径同时可见。"""
+    legacy_plugins = importlib.import_module("app.plugins")
+    canonical = importlib.import_module("app.sdk.plugin.base")._PluginBase
+    sdk = importlib.import_module("app.sdk.plugin")._PluginBase
+    marker = object()
+
+    monkeypatch.setattr(canonical, "_compat_identity_marker", marker, raising=False)
+
+    assert legacy_plugins._PluginBase is canonical
+    assert sdk is canonical
+    assert legacy_plugins._PluginBase._compat_identity_marker is marker
+
+
+def test_legacy_plugin_chain_spelling_resolves_to_renamed_sdk_class():
+    """历史拼写 PluginChian 只存在于兼容层，解析到 SDK 的正名 PluginChain。"""
+    configure_legacy_import_diagnostics(enabled=False, emitter=lambda _: None)
+    try:
+        legacy_plugins = importlib.import_module("app.plugins")
+        sdk = importlib.import_module("app.sdk.plugin")
+
+        assert legacy_plugins.PluginChian is sdk.PluginChain
+        assert not hasattr(sdk, "PluginChian")
+        assert "PluginChian" not in legacy_plugins.__all__
+    finally:
+        reset_legacy_import_diagnostics()
+
+
+def test_shadow_detection_flags_second_implementation():
+    """物理模块自带第二份实现时必须被判定为遮蔽兼容符号。"""
+    module = ModuleType("app.plugins")
+    module._PluginBase = type("_PluginBase", (), {})
+
+    shadowed = detect_shadowed_exports(module, SYMBOL_ALIASES["app.plugins"])
+
+    assert shadowed == [("_PluginBase", "app.sdk.plugin._PluginBase")]
+
+
+def test_shadow_detection_allows_reimported_canonical_symbol():
+    """物理模块重新导入同一个 canonical 对象不算遮蔽。"""
+    canonical = importlib.import_module("app.sdk.plugin.base")
+    module = ModuleType("app.plugins")
+    module._PluginBase = canonical._PluginBase
+    module.PluginChian = canonical.PluginChain
+
+    assert detect_shadowed_exports(module, SYMBOL_ALIASES["app.plugins"]) == []
+
+
+def test_installed_symbol_overlay_modules_have_no_shadowed_exports():
+    """已装载的兼容叠加模块都不得用第二份实现遮蔽登记符号。"""
+    configure_legacy_import_diagnostics(enabled=False, emitter=lambda _: None)
+    try:
+        violations: dict[str, list] = {}
+        for module_name, exports in SYMBOL_ALIASES.items():
+            try:
+                module = importlib.import_module(module_name)
+            except ModuleNotFoundError:
+                continue
+            shadowed = detect_shadowed_exports(module, exports)
+            if shadowed:
+                violations[module_name] = shadowed
+        assert violations == {}
+    finally:
+        reset_legacy_import_diagnostics()
+
+
+def test_sdk_plugins_module_alias_reuses_manager_module():
+    """旧 SDK 路径 app.sdk.plugins 只经精确别名复用插件管理器模块。"""
+    alias = MODULE_ALIASES["app.sdk.plugins"]
+    configure_legacy_import_diagnostics(enabled=False, emitter=lambda _: None)
+    try:
+        assert alias.target == "app.sdk.plugin.manager"
+        assert alias.replacement == "app.sdk.plugin.manager"
+        assert importlib.import_module("app.sdk.plugins") is importlib.import_module(
+            "app.sdk.plugin.manager"
+        )
+    finally:
+        reset_legacy_import_diagnostics()
+
+
+def test_plugins_package_root_source_matches_shipped_file():
+    """自愈写回的包根源码必须与后端源码提供的包根完全一致。"""
+    shipped = Path(__file__).resolve().parents[1] / "app" / "plugins" / "__init__.py"
+    assert shipped.read_text(encoding="utf-8") == PLUGINS_PACKAGE_ROOT_SOURCE
+
+
+def test_plugins_package_root_shadowing_detects_legacy_host_implementation(tmp_path):
+    """旧版本自带宿主实现的包根必须被判定为遮蔽兼容符号。"""
+    init_file = tmp_path / "__init__.py"
+    init_file.write_text(
+        "from abc import ABCMeta\n"
+        "\n"
+        "\n"
+        "class PluginChian:\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "class _PluginBase(metaclass=ABCMeta):\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    assert detect_plugins_package_root_shadowing(init_file) == [
+        "PluginChian",
+        "_PluginBase",
+    ]
+
+
+def test_plugins_package_root_shadowing_ignores_reimported_symbols(tmp_path):
+    """包根只重新导入 canonical 对象不算遮蔽，自愈必须放过它。"""
+    init_file = tmp_path / "__init__.py"
+    init_file.write_text(
+        '"""说明。"""\n'
+        "\n"
+        "from app.sdk.plugin.base import PluginChain as PluginChian\n"
+        "from app.sdk.plugin.base import _PluginBase\n",
+        encoding="utf-8",
+    )
+    assert detect_plugins_package_root_shadowing(init_file) == []
+
+
+def test_plugins_package_root_shadowing_tolerates_unreadable_source(tmp_path):
+    """包根缺失或语法错误时返回空列表，把故障留给标准导入流程。"""
+    missing_file = tmp_path / "__init__.py"
+    assert detect_plugins_package_root_shadowing(missing_file) == []
+    missing_file.write_text("class _PluginBase(\n", encoding="utf-8")
+    assert detect_plugins_package_root_shadowing(missing_file) == []
+
+
+def test_restore_plugins_package_root_backs_up_and_rewrites(tmp_path):
+    """自愈必须先备份原文件再写回只含说明的命名空间入口。"""
+    init_file = tmp_path / "__init__.py"
+    legacy_source = "class _PluginBase:\n    pass\n"
+    init_file.write_text(legacy_source, encoding="utf-8")
+    backup_file = restore_plugins_package_root(init_file)
+    assert backup_file.name == "__init__.py" + PLUGINS_PACKAGE_ROOT_BACKUP_SUFFIX
+    assert backup_file.read_text(encoding="utf-8") == legacy_source
+    assert init_file.read_text(encoding="utf-8") == PLUGINS_PACKAGE_ROOT_SOURCE
+    assert detect_plugins_package_root_shadowing(init_file) == []
+
+
+def test_startup_repairs_plugin_package_root_before_loading_plugins(tmp_path, monkeypatch):
+    """启动装配必须在导入插件前把被遮蔽的包根恢复成命名空间入口。"""
+    plugins_root = tmp_path / "app" / "plugins"
+    plugins_root.mkdir(parents=True)
+    init_file = plugins_root / "__init__.py"
+    init_file.write_text("class PluginChian:\n    pass\n", encoding="utf-8")
+    monkeypatch.setattr(
+        plugins_initializer,
+        "get_runtime_setting",
+        lambda name: str(tmp_path) if name == "ROOT_PATH" else None,
+    )
+    assert plugins_initializer.repair_plugin_package_root() == ["PluginChian"]
+    assert init_file.read_text(encoding="utf-8") == PLUGINS_PACKAGE_ROOT_SOURCE
+    assert (
+        plugins_root / ("__init__.py" + PLUGINS_PACKAGE_ROOT_BACKUP_SUFFIX)
+    ).read_text(encoding="utf-8") == "class PluginChian:\n    pass\n"
+    assert plugins_initializer.repair_plugin_package_root() == []
+
+
+def test_startup_keeps_hard_failure_when_plugin_root_is_read_only(tmp_path, monkeypatch):
+    """运行目录不可写时自愈降级为报错并返回遮蔽符号，不静默跳过。"""
+    plugins_root = tmp_path / "app" / "plugins"
+    plugins_root.mkdir(parents=True)
+    (plugins_root / "__init__.py").write_text(
+        "class _PluginBase:\n    pass\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        plugins_initializer,
+        "get_runtime_setting",
+        lambda name: str(tmp_path) if name == "ROOT_PATH" else None,
+    )
+
+    def _deny(_init_file):
+        raise OSError("Read-only file system")
+
+    monkeypatch.setattr(plugins_initializer, "restore_plugins_package_root", _deny)
+    assert plugins_initializer.repair_plugin_package_root() == ["_PluginBase"]

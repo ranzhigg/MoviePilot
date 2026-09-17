@@ -10,6 +10,7 @@ from app.agent.policy import (
     ActionEffect,
     ConfirmationMode,
     PrincipalRole,
+    RecoveryMode,
 )
 from app.agent.policy.api import (
     API_EXTENDED_OPERATION_SPECS,
@@ -28,13 +29,13 @@ from app.agent.tools.manager import MoviePilotToolsManager
 
 
 def test_api_operation_registry_matches_migration_batches() -> None:
-    """API 操作注册表必须覆盖两批 operation 且每项具有固定路由。"""
-    assert len(API_FIRST_BATCH_OPERATION_SPECS) == 52
-    assert len(API_PARITY_OPERATION_SPECS) == 15
+    """API 操作注册表必须覆盖各迁移批次且每项具有固定路由。"""
+    assert len(API_FIRST_BATCH_OPERATION_SPECS) == 53
+    assert len(API_PARITY_OPERATION_SPECS) == 17
     assert len(API_MUSIC_OPERATION_SPECS) == 10
     assert len(API_SYSTEM_OPERATION_SPECS) == 7
-    assert len(API_EXTENDED_OPERATION_SPECS) == 118
-    assert len(API_OPERATION_SPECS) == 202
+    assert len(API_EXTENDED_OPERATION_SPECS) == 144
+    assert len(API_OPERATION_SPECS) == 231
     assert {spec.operation_id for spec in API_OPERATION_SPECS} == set(API_OPERATION_ROUTES)
     assert {
         "download.list",
@@ -71,6 +72,54 @@ def test_api_operation_registry_matches_migration_batches() -> None:
         "system.module.list",
         "plugin.clone",
     }.issubset(API_OPERATION_ROUTES)
+
+
+def test_classification_operations_expose_versioned_policy_contract() -> None:
+    """媒体自动分类必须只暴露新版查询、校验、预览和版本化写入合同。"""
+    expected_routes = {
+        "media.classification.fields": ("GET", "/api/v1/media/classification/fields"),
+        "media.classification.policy.get": ("GET", "/api/v1/media/classification/policy"),
+        "media.classification.policy.validate": ("POST", "/api/v1/media/classification/validate"),
+        "media.classification.policy.preview": ("POST", "/api/v1/media/classification/preview"),
+        "media.classification.policy.impact": ("POST", "/api/v1/media/classification/impact"),
+        "media.classification.policy.history": ("GET", "/api/v1/media/classification/history"),
+        "media.classification.policy.update": ("PUT", "/api/v1/media/classification/policy"),
+        "media.classification.policy.rollback": (
+            "POST",
+            "/api/v1/media/classification/rollback/{revision}",
+        ),
+    }
+    assert {
+        operation_id: (route.method, route.path)
+        for operation_id, route in API_OPERATION_ROUTES.items()
+        if operation_id.startswith("media.classification.")
+    } == expected_routes
+    assert {"media.categories", "media.category.config.get"}.isdisjoint(API_OPERATION_ROUTES)
+
+    specs = {spec.operation_id: spec for spec in API_OPERATION_SPECS}
+    assert specs["media.classification.policy.update"].effect is ActionEffect.REVERSIBLE_WRITE
+    assert specs["media.classification.policy.rollback"].effect is ActionEffect.REVERSIBLE_WRITE
+    assert specs["media.classification.policy.update"].required_role is PrincipalRole.SYSTEM_ADMIN
+    assert specs["media.classification.policy.rollback"].required_role is PrincipalRole.SYSTEM_ADMIN
+    assert specs["media.classification.policy.update"].confirmation is ConfirmationMode.REQUIRED
+    assert specs["media.classification.policy.rollback"].confirmation is ConfirmationMode.REQUIRED
+    assert specs["media.classification.policy.update"].recovery is RecoveryMode.TRANSACTION
+    assert specs["media.classification.policy.rollback"].recovery is RecoveryMode.TRANSACTION
+
+    schema = MoviePilotApiTool(session_id="session", user_id="api_user").get_mcp_input_schema()
+    branches = {
+        item["properties"]["operation_id"]["const"]: item
+        for item in schema["oneOf"]
+    }
+    assert branches["media.classification.policy.update"]["properties"]["body"]["$ref"].endswith(
+        "/ClassificationPolicyPublishRequest"
+    )
+    assert branches["media.classification.policy.preview"]["properties"]["body"]["$ref"].endswith(
+        "/ClassificationPreviewRequest"
+    )
+    assert branches["media.classification.policy.rollback"]["properties"]["path_params"]["required"] == [
+        "revision"
+    ]
 
 
 def test_api_tool_message_displays_secret_safe_major_parameters() -> None:
@@ -145,6 +194,16 @@ def test_mcp_tools_list_preserves_all_moviepilot_api_operation_branches() -> Non
     assert operation_ids == set(API_OPERATION_ROUTES)
 
 
+def test_local_agent_tool_uses_the_same_precise_operation_schema() -> None:
+    """本地 Agent 绑定的工具 schema 至少必须提示 body 是 JSON 结构值。"""
+    tool = MoviePilotApiTool(session_id="session", user_id="api_user")
+    schema = tool.tool_call_schema
+    assert not isinstance(schema, dict)
+    body = schema.model_json_schema()["properties"]["body"]
+
+    assert body["$ref"].endswith("/JsonData")
+
+
 def test_mcp_collection_contract_distinguishes_exact_and_unavailable_totals() -> None:
     """MCP 必须说明缺省全量、精确总数和外部无总数三种集合语义。"""
     schema = MoviePilotApiTool(session_id="session", user_id="api_user").get_mcp_input_schema()
@@ -172,16 +231,18 @@ def test_mcp_collection_contract_distinguishes_exact_and_unavailable_totals() ->
         "collection.total_count"
     )
 
-    for operation_id in (
-        "subscription.history",
-        "download.history.list",
-        "plugin.installed",
-        "plugin.market",
-    ):
+    for operation_id in ("subscription.history", "download.history.list"):
         local_page = branches[operation_id]["x-moviepilot-collection"]
         assert local_page["total_count_field"] == "collection.total_count"
         assert local_page["default_pagination"] == "endpoint-defined"
         assert "defaults remain in effect" in branches[operation_id]["description"]
+
+    for operation_id in ("plugin.installed", "plugin.market"):
+        local_page = branches[operation_id]["x-moviepilot-collection"]
+        assert local_page["total_count_field"] == "collection.total_count"
+        assert local_page["default_pagination"] == "unpaginated"
+        assert "omit both page and count" in branches[operation_id]["description"]
+        assert "default" not in branches[operation_id]["properties"]["query"]["properties"]["max_results"]
 
     media_search = branches["media.search"]["x-moviepilot-collection"]
     assert media_search["result_count_field"] == "collection.result_count"
@@ -221,7 +282,9 @@ def test_plugin_operations_expose_discovery_before_precise_writes() -> None:
     installed_query = branches["plugin.installed"]["properties"]["query"]
     assert installed_query["properties"]["state"]["const"] == "installed"
     assert "query" in installed_query["properties"]
-    assert installed_query["properties"]["max_results"]["maximum"] == 200
+    max_results = installed_query["properties"]["max_results"]
+    integer_variant = next(item for item in max_results["anyOf"] if item.get("type") == "integer")
+    assert integer_variant["maximum"] == 200
 
     config_get_path = API_OPERATION_ROUTES["plugin.config.get"].path
     assert config_get_path == "/api/v1/plugin/form/{plugin_id}"
@@ -367,18 +430,16 @@ def test_gateway_forwards_structured_arguments_to_api_executor() -> None:
     result = asyncio.run(
         gateway.run(
             operation_id="media.search",
-            path_params={"media_type": "movie"},
-            query={"page": 1},
-            body={"title": "示例"},
+            query={"page": 1, "title": "示例"},
         )
     )
 
     assert json.loads(result)["success"] is True
     executor.execute.assert_awaited_once_with(
         "media.search",
-        path_params={"media_type": "movie"},
-        query={"page": 1},
-        body={"title": "示例"},
+        path_params=None,
+        query={"page": 1, "title": "示例"},
+        body=None,
     )
 
 
@@ -390,6 +451,32 @@ def test_gateway_rejects_unknown_operation() -> None:
 
     assert '"success": false' in result
     assert "unknown_operation" in result
+
+
+def test_gateway_returns_operation_contract_when_input_is_invalid() -> None:
+    """单个 operation 的参数错误必须返回可直接纠正调用的精确合同。"""
+    executor = AsyncMock()
+    gateway = MoviePilotApiTool(
+        session_id="session",
+        user_id="1",
+        executor=executor,
+    )
+
+    result = asyncio.run(
+        gateway.run(
+            operation_id="site.list",
+            query={"status": "enabled"},
+        )
+    )
+    payload = json.loads(result)
+
+    assert payload["error"] == "invalid_input"
+    assert payload["operation_id"] == "site.list"
+    assert payload["input_contract"]["allowed_arguments"] == ["query"]
+    status = payload["input_contract"]["query"]["fields"]["status"]
+    assert status["enum"] == ["active", "inactive", "all"]
+    assert "enabled" not in json.dumps(payload, ensure_ascii=False)
+    executor.execute.assert_not_awaited()
 
 
 def test_gateway_rejects_admin_operation_for_non_admin_before_http() -> None:

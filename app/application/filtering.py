@@ -389,18 +389,14 @@ def normalize_rule_group(
 async def save_system_config(
     key: SystemConfigKey,
     value: Any,
-    publish_config_changed: RuleConfigPublisher,
 ) -> Optional[bool]:
-    """通过统一入口保存配置并补发 ConfigChanged 事件。"""
+    """通过统一异步配置入口保存配置并等待运行时重载。"""
     normalized_value = value
     if isinstance(normalized_value, list):
         normalized_value = [item for item in normalized_value if item is not None and item != ""]
         normalized_value = normalized_value or None
 
-    success = await get_configured_system_config().async_set(key, normalized_value)
-    if success:
-        await publish_config_changed(key, normalized_value)
-    return success
+    return await get_configured_system_config().async_set(key, normalized_value)
 
 
 def replace_rule_id_in_rule_string(rule_string: str, old_rule_id: str, new_rule_id: str) -> str:
@@ -499,12 +495,48 @@ class FilterRuleService:
         await save_system_config(
             SystemConfigKey.CustomFilterRules,
             [rule.model_dump(exclude_none=True) for rule in rules],
-            self._publish_config_changed,
         )
         return {
             "message": f"已新增自定义过滤规则 {new_rule.id}",
             "custom_rule": serialize_custom_rule(new_rule),
             "count": len(rules),
+        }
+
+    async def reorder_custom(
+        self,
+        rule_ids: list[str],
+        *,
+        expected_rule_ids: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """按完整 ID 列表重排规则，并用事务快照拒绝并发覆盖。"""
+        rules = get_custom_rules()
+        current_ids = [str(rule.id) for rule in rules if rule.id]
+        if len(current_ids) != len(rules):
+            raise ValueError("自定义规则存在缺少 ID 的损坏项，不能调整顺序")
+        self._validate_reorder(
+            "自定义规则",
+            current_ids,
+            rule_ids,
+            expected_rule_ids,
+        )
+        rules_by_id = {str(rule.id): rule for rule in rules if rule.id}
+        ordered_rules = [rules_by_id[rule_id] for rule_id in rule_ids]
+        expected_rules = [rule.model_dump(exclude_none=True) for rule in rules]
+        rule_definitions = [rule.model_dump(exclude_none=True) for rule in ordered_rules]
+        groups = get_rule_groups()
+        group_definitions = [group.model_dump(exclude_none=True) for group in groups]
+        async with self._mutation_scope() as mutation:
+            await mutation.apply(
+                group_definitions,
+                expected_rule_groups=group_definitions,
+                custom_rules=rule_definitions,
+                expected_custom_rules=expected_rules,
+            )
+        await self._publish_config_changed(SystemConfigKey.CustomFilterRules, rule_definitions)
+        return {
+            "message": "已调整自定义过滤规则顺序",
+            "count": len(rule_ids),
+            "rule_ids": rule_ids,
         }
 
     async def update_custom(
@@ -570,7 +602,6 @@ class FilterRuleService:
             await save_system_config(
                 SystemConfigKey.CustomFilterRules,
                 rule_definitions,
-                self._publish_config_changed,
             )
         if updated.id is None:
             raise ValueError("更新后的自定义过滤规则缺少 id")
@@ -593,7 +624,6 @@ class FilterRuleService:
         await save_system_config(
             SystemConfigKey.CustomFilterRules,
             [rule.model_dump(exclude_none=True) for rule in remaining],
-            self._publish_config_changed,
         )
         return {
             "message": f"已删除自定义过滤规则 {rule_id}",
@@ -632,6 +662,36 @@ class FilterRuleService:
             "rule_group": serialize_rule_group(new_group, usage.get(new_group.name)),
             "parsed": parsed,
             "count": len(definitions),
+        }
+
+    async def reorder_groups(
+        self,
+        group_names: list[str],
+        *,
+        expected_group_names: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """按完整名称列表重排规则组，并复用原子修改作用域。"""
+        groups = get_rule_groups()
+        current_names = [str(group.name) for group in groups if group.name]
+        if len(current_names) != len(groups):
+            raise ValueError("规则组存在缺少名称的损坏项，不能调整顺序")
+        self._validate_reorder(
+            "规则组",
+            current_names,
+            group_names,
+            expected_group_names,
+        )
+        groups_by_name = {str(group.name): group for group in groups if group.name}
+        ordered_groups = [groups_by_name[name] for name in group_names]
+        expected = [group.model_dump(exclude_none=True) for group in groups]
+        definitions = [group.model_dump(exclude_none=True) for group in ordered_groups]
+        async with self._mutation_scope() as mutation:
+            await mutation.apply(definitions, expected_rule_groups=expected)
+        await self._publish_config_changed(SystemConfigKey.UserFilterRuleGroups, definitions)
+        return {
+            "message": "已调整过滤规则组顺序",
+            "count": len(group_names),
+            "group_names": group_names,
         }
 
     async def update_group(
@@ -702,3 +762,24 @@ class FilterRuleService:
             "count": len(remaining),
             "reference_updates": result.to_dict(),
         }
+
+    @staticmethod
+    def _validate_reorder(
+        item_label: str,
+        current_names: list[str],
+        requested_names: list[str],
+        expected_names: Optional[list[str]],
+    ) -> None:
+        """验证重排列表完整、唯一且基于未过期的名称集合。"""
+        if any(not name.strip() for name in requested_names):
+            raise ValueError(f"{item_label}顺序不能包含空名称")
+        if len(set(requested_names)) != len(requested_names):
+            raise ValueError(f"{item_label}顺序不能包含重复名称")
+        if set(requested_names) != set(current_names):
+            raise ValueError(f"{item_label}集合已变化，请重新读取后再试")
+        if (
+            expected_names is not None
+            and current_names != expected_names
+            and current_names != requested_names
+        ):
+            raise ValueError(f"{item_label}顺序已被其他请求修改，请重新读取后再试")

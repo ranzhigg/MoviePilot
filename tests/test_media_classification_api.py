@@ -22,6 +22,7 @@ from app.api.routers import API_V1_ROUTER_SPECS
 from app.application.classification.analysis import (
     ClassificationAnalysisService,
     RecentHistoryClassificationSampleProvider,
+    build_classification_facts_from_media_payload,
 )
 from app.application.classification.configuration import (
     ClassificationPolicyConfigurationService,
@@ -240,6 +241,32 @@ def test_field_catalog_exposes_retired_fields_outside_new_rule_options() -> None
     assert catalog.retired_fields[0].replacement_field == "media.genre_keys"
 
 
+def test_preview_media_payload_preserves_dotted_plugin_source_facts() -> None:
+    """扩展来源 ID 含点号时，预览仍按完整命名空间读取事实。"""
+    field = ClassificationFieldDefinition(
+        id="extensions.plugin.example.region",
+        label="区域",
+        value_type="string",
+        operators=["equals"],
+        media_types=["电影"],
+        source_support={"plugin.example": "extension"},
+    )
+
+    facts = build_classification_facts_from_media_payload(
+        {
+            "media_source": "plugin.example",
+            "media_id": "native-1",
+            "type": "电影",
+            "classification_facts": {
+                "extensions.plugin.example.region": "east-asia",
+            },
+        },
+        extra_fields=[field],
+    )
+
+    assert facts.extensions == {"plugin.example": {"region": "east-asia"}}
+
+
 def test_preview_returns_condition_path_and_structured_missing_fact_warning() -> None:
     """预览 trace 能定位规则条件，缺失字段提示保留代码、字段和来源。"""
     service = _service()
@@ -266,10 +293,85 @@ def test_preview_returns_condition_path_and_structured_missing_fact_warning() ->
         )
     )
 
-    assert evaluation.trace[0].conditions[0].path == ["rules", 0, "when"]
-    assert evaluation.warnings[0].code == "missing_fact"
-    assert evaluation.warnings[0].field == "media.language"
+    rule_index = next(
+        index for index, rule in enumerate(policy.rules) if rule.id == "rule.language"
+    )
+    language_trace = next(
+        trace for trace in evaluation.trace if trace.rule_id == "rule.language"
+    )
+    assert language_trace.conditions[0].path == ["rules", rule_index, "when"]
+    assert evaluation.warnings
+    assert all(warning.code == "missing_fact" for warning in evaluation.warnings)
+    assert any(warning.field == "media.language" for warning in evaluation.warnings)
     assert evaluation.warnings[0].source == "themoviedb"
+
+
+def test_preview_selected_media_uses_complete_movie_and_music_details() -> None:
+    """选择搜索结果后应直接使用影视和音乐的完整标准字段进行预览。"""
+    analysis = ClassificationAnalysisService(_service())
+
+    movie = analysis.preview(
+        ClassificationPreviewRequest(
+            input={
+                "kind": "media",
+                "media": {
+                    "media_source": "themoviedb",
+                    "media_id": "550",
+                    "type": "电影",
+                    "title": "搏击俱乐部",
+                    "year": "1999",
+                    "original_language": "en",
+                    "origin_country": ["US"],
+                    "genre_ids": [878],
+                    "genres": [{"id": 878, "name": "科幻"}],
+                    "content_rating": "R",
+                },
+            }
+        )
+    )
+
+    assert movie.facts.identity.media_id == "550"
+    assert movie.facts.media.year == 1999
+    assert movie.facts.media.language == "en"
+    assert movie.facts.media.countries == ["US"]
+    assert movie.facts.media.genre_keys == ["science_fiction"]
+    assert movie.facts.media.genre_names == ["科幻"]
+    assert movie.facts.media.content_rating == "R"
+
+    music = analysis.preview(
+        ClassificationPreviewRequest(
+            input={
+                "kind": "media",
+                "media": {
+                    "media_source": "musicbrainz",
+                    "media_id": "release-1",
+                    "type": "音乐",
+                    "music_type": "album",
+                    "title": "现场专辑",
+                    "album": "现场专辑",
+                    "album_type": "album",
+                    "secondary_types": ["Live"],
+                    "year": 2020,
+                    "genres": ["摇滚"],
+                    "tags": ["现场"],
+                    "artists": ["示例乐队"],
+                    "artist_country": "英国",
+                    "release_status": "official",
+                },
+            }
+        )
+    )
+
+    assert music.facts.identity.media_id == "release-1"
+    assert music.facts.media.type == "音乐"
+    assert music.facts.media.countries == ["GB"]
+    assert music.facts.media.genre_keys == ["rock"]
+    assert music.facts.music is not None
+    assert music.facts.music.entity_type == "album"
+    assert music.facts.music.secondary_types == ["Live"]
+    assert music.facts.music.genres == ["摇滚"]
+    assert music.facts.music.tags == ["现场"]
+    assert music.facts.music.artists == ["示例乐队"]
 
 
 @pytest.mark.asyncio  # type: ignore[misc]
@@ -336,6 +438,123 @@ async def test_recent_history_samples_are_bounded_deduplicated_and_honest() -> N
     assert batch.facts[1].music is not None
     assert batch.facts[1].music.entity_type == "album"
     assert "仅稳定保存" in batch.warnings[0]
+
+
+@pytest.mark.asyncio  # type: ignore[misc]
+async def test_explicit_impact_samples_are_deduplicated_by_primary_identity() -> None:
+    """显式影响样本重复提交时不得放大分类变化统计。"""
+    service = _service()
+    analysis = ClassificationAnalysisService(service)
+    sample = _facts(media_source="douban", media_id="same")
+
+    result = await analysis.impact(
+        _candidate_policy(),
+        expected_revision=1,
+        sample_limit=100,
+        example_limit=20,
+        samples=[sample, sample.model_copy(deep=True)],
+    )
+
+    assert result.sample_count == 1
+    assert result.scanned_count == 2
+    assert result.skipped_count == 1
+    assert result.truncated is True
+    assert any("重复" in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio  # type: ignore[misc]
+async def test_impact_analysis_resolves_complete_history_details_and_reports_gaps() -> None:
+    """影响分析应以历史身份重新读取完整字段，并单独统计无法读取的记录。"""
+    service = _service()
+    policy = build_default_classification_policy()
+    policy.categories.append(
+        ClassificationCategory(
+            id="movie.science-fiction",
+            media_type="电影",
+            name="科幻电影",
+            path=["科幻"],
+        )
+    )
+    policy.rules.append(
+        ClassificationRule(
+            id="rule.movie.science-fiction",
+            name="科幻电影",
+            kind="category",
+            media_types=["电影"],
+            when=ClassificationCondition(
+                field="media.genre_keys",
+                operator="contains_any",
+                value=["science_fiction"],
+            ),
+            target=ClassificationTarget(category_id="movie.science-fiction"),
+        )
+    )
+    records = [
+        DownloadHistorySnapshot(
+            id=10,
+            path="/downloads/movie-10",
+            type="电影",
+            title="基础标题",
+            media_source=MediaSource.TMDB,
+            media_id="10",
+            date="2026-09-02 10:00:00",
+        ),
+        DownloadHistorySnapshot(
+            id=11,
+            path="/downloads/movie-11",
+            type="电影",
+            title="完整标题",
+            media_source=MediaSource.TMDB,
+            media_id="11",
+            date="2026-09-02 09:00:00",
+        ),
+        DownloadHistorySnapshot(
+            id=12,
+            path="/downloads/movie-12",
+            type="电影",
+            title="无法读取",
+            media_source=MediaSource.TMDB,
+            media_id="12",
+            date="2026-09-02 08:00:00",
+        ),
+    ]
+    complete_facts = {
+        "10": _facts(media_id="10"),
+        "11": _facts(media_id="11"),
+    }
+    complete_facts["10"].media.genre_keys = ["science_fiction"]
+    complete_facts["11"].media.genre_keys = ["drama"]
+    resolved_ids: list[str] = []
+
+    async def resolve_history(history: object) -> ClassificationFacts | None:
+        """返回测试中的完整媒体事实，模拟详情接口缺失一条记录。"""
+        media_id = str(getattr(history, "media_id", ""))
+        resolved_ids.append(media_id)
+        return complete_facts.get(media_id)
+
+    provider = RecentHistoryClassificationSampleProvider(
+        download_history=cast(object, _DownloadHistory(records)),
+        transfer_history=cast(object, _TransferHistory([])),
+        facts_resolver=resolve_history,
+    )
+    result = await ClassificationAnalysisService(
+        service,
+        sample_provider=provider,
+    ).impact(
+        policy,
+        expected_revision=1,
+        sample_limit=10,
+        example_limit=20,
+    )
+
+    assert resolved_ids == ["10", "11", "12"]
+    assert result.scanned_count == 3
+    assert result.sample_count == 2
+    assert result.skipped_count == 1
+    assert result.unresolved_count == 1
+    assert result.changed_count == 1
+    assert result.changes[0].identity.media_id == "10"
+    assert any("无法获取完整媒体信息" in warning for warning in result.warnings)
 
 
 @pytest.mark.asyncio  # type: ignore[misc]
@@ -523,6 +742,10 @@ def test_fastapi_envelope_and_conflict_payload_are_frontend_compatible() -> None
 
     client = TestClient(app)
     policy_response = client.get("/api/v1/media/classification/policy")
+    default_policy_response = client.get(
+        "/api/v1/media/classification/policy",
+        params={"template": "default"},
+    )
     conflict_response = client.put(
         "/api/v1/media/classification/policy",
         json={
@@ -534,6 +757,8 @@ def test_fastapi_envelope_and_conflict_payload_are_frontend_compatible() -> None
     assert policy_response.status_code == 200
     assert policy_response.json()["data"]["revision"] == 1
     assert "success" not in policy_response.json()["data"]
+    assert default_policy_response.status_code == 200
+    assert default_policy_response.json()["data"] == build_default_classification_policy().model_dump(mode="json")
     assert conflict_response.status_code == 409
     assert conflict_response.json()["data"] == {
         "code": "classification_revision_conflict",

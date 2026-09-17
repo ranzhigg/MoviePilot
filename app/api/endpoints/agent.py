@@ -31,15 +31,13 @@ from app.api.response import (
 )
 from app.application import agent as agent_application
 from app.application.messaging import agent as web_agent_application
-from app.application.messaging.agent import (
-    parse_agent_choice_callback,
-)
 from app.application.messaging.chat import (
     AgentChatPersistenceService,
     AgentChatService,
     get_configured_agent_chat_persistence,
     get_configured_agent_chat_service,
 )
+from app.application.messaging.interaction.agent import parse_agent_choice_callback
 from app.runtime.events import eventmanager
 from app.runtime.localization import LocaleHelper
 from app.runtime.log import logger
@@ -151,13 +149,13 @@ async def test_agent_mcp_server(
             data=result.model_dump(),
         )
     except Exception as err:
-        logger.warning(f"测试 Agent MCP 服务器失败: {err}")
+        logger.warning(f"测试 Agent MCP 服务器失败: {err}", exc_info=True)
         return _SchemaResponse(
             success=False,
-            message=f"测试MCP服务器失败: {str(err)}",
+            message="MCP 服务测试失败，请检查服务配置后重试",
             data={
                 "success": False,
-                "message": str(err),
+                "message": "MCP 服务测试失败，请检查服务配置后重试",
                 "tools": [],
                 "tool_count": 0,
             },
