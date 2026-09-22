@@ -712,8 +712,11 @@ class ConfigModel(BaseModel):
     )
 
     # ==================== Github & PIP ====================
-    # Github token，提高请求api限流阈值 ghp_****
-    GITHUB_TOKEN: Optional[str] = None
+    # Github token，提高请求api限流阈值；原文只应保留在服务端运行配置中
+    GITHUB_TOKEN: Annotated[
+        Optional[str],
+        SettingPolicy(sensitive=True),
+    ] = None
     # Github代理服务器，格式：https://mirror.ghproxy.com/
     GITHUB_PROXY: Optional[str] = ""
     # pip镜像站点，格式：https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
@@ -834,7 +837,7 @@ class ConfigModel(BaseModel):
     LLM_USE_PROXY: bool = True
     # LLM Base URL 预设标识，用于区分同一 Base URL 下的不同模型目录
     LLM_BASE_URL_PRESET: Optional[str] = None
-    # LLM最大上下文Token数量（K），用于目录缺失回退和未匹配兼容端点的保守上限
+    # LLM最大上下文Token数量（K），用于目录缺失回退和未匹配兼容端点的用户上限
     LLM_MAX_CONTEXT_TOKENS: int = 256
     # LLM OpenAI兼容接口请求User-Agent
     LLM_USER_AGENT: Optional[str] = None

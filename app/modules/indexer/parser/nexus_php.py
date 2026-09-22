@@ -76,6 +76,11 @@ class NexusPhpSiteUserInfo(SiteParserBase):
             if not DomUtils.has_child_elements(html):
                 return
 
+            user_level = self._parse_user_level_marker(html.xpath("string(.)"), self.userid)
+            if user_level:
+                # 基类为兼容旧解析器未声明 Optional[str]，保留运行时字段语义。
+                self.user_level = user_level  # type: ignore[assignment]
+
             ret = html.xpath(f'//a[contains(@href, "userdetails") and contains(@href, "{self.userid}")]//b//text()')
             if ret:
                 self.username = str(ret[0])
@@ -125,12 +130,24 @@ class NexusPhpSiteUserInfo(SiteParserBase):
                 if bonus_match and bonus_match.group(1).strip():
                     self.bonus = text_tools.parse_float(bonus_match.group(1))
                     return
+            # PTT-NP 的 mybonus 链接文本只有“使用&说明”，数值位于同一容器的文本中。
+            bonus_links = html.xpath('//a[contains(@href,"mybonus")]') if html is not None else []
+            for bonus_link in bonus_links:
+                bonus_containers = bonus_link.xpath('ancestor::*[contains(., "魔力值")][1]')
+                if not bonus_containers:
+                    bonus_containers = bonus_link.xpath('parent::*')
+                for bonus_container in bonus_containers:
+                    bonus_text = bonus_container.xpath("string(.)")
+                    bonus_match = re.search(r"魔力值.*?[：:]\s*([\d,.]+)", bonus_text, flags=re.S)
+                    if bonus_match and bonus_match.group(1).strip():
+                        self.bonus = text_tools.parse_float(bonus_match.group(1))
+                        return
             bonus_match = re.search(r"mybonus.[\[\]:：<>/a-zA-Z_\-=\"'\s#;.(使用魔力值豆]+\s*([\d,.]+)[<()&\s]", html_text)
             try:
                 if bonus_match and bonus_match.group(1).strip():
                     self.bonus = text_tools.parse_float(bonus_match.group(1))
                     return
-                bonus_match = re.search(r"[魔力值|\]][\[\]:：<>/a-zA-Z_\-=\"'\s#;]+\s*([\d,.]+|\"[\d,.]+\")[<>()&\s]",
+                bonus_match = re.search(r"(?:魔力值|\])[\[\]:：<>/a-zA-Z_\-=\"'\s#;]+\s*([\d,.]+|\"[\d,.]+\")[<>()&\s]",
                                         html_text,
                                         flags=re.S)
                 if bonus_match and bonus_match.group(1).strip():
@@ -365,8 +382,24 @@ class NexusPhpSiteUserInfo(SiteParserBase):
         # if seeding_url_text:
         #    self._torrent_seeding_page = seeding_url_text
 
+    @staticmethod
+    def _parse_user_level_marker(page_text: str, userid: Optional[str]) -> Optional[str]:
+        """
+        解析 PTT-NP 首页中 UID 标记后的通用用户等级。
+        """
+        user_id_pattern = re.escape(str(userid)) if userid else r"\d+"
+        user_level_match = re.search(
+            rf"\[\s*UID\s*=\s*{user_id_pattern}\s*\]\s*\[\s*\([^\)\]]+\)\s*([^\]]+?)\s*\]",
+            page_text,
+            flags=re.IGNORECASE,
+        )
+        return user_level_match.group(1).strip() if user_level_match else None
+
     def _get_user_level(self, html):
-        # 等级 获取同一行等级数据，图片格式等级，取title信息，否则取文本信息
+        """
+        从用户详情页或首页中解析用户等级。
+        """
+        # 等级获取同一行等级数据，图片格式等级取 title 信息，否则取文本信息。
         user_levels_text = html.xpath('//tr/td[text()="等級" or text()="等级" or *[text()="等级"]]/'
                                       'following-sibling::td[1]/img[1]/@title')
         if user_levels_text:
@@ -394,6 +427,11 @@ class NexusPhpSiteUserInfo(SiteParserBase):
                 if user_level_match and user_level_match.group(1).strip():
                     self.user_level = user_level_match.group(1).strip()
                     break
+
+        user_level = self._parse_user_level_marker(html.xpath("string(.)"), self.userid)
+        if user_level:
+            # 基类为兼容旧解析器未声明 Optional[str]，保留运行时字段语义。
+            self.user_level = user_level  # type: ignore[assignment]
 
     def _parse_message_unread_links(self, html_text: str, msg_links: list) -> Optional[str]:
         html = etree.HTML(html_text)
